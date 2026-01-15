@@ -96,4 +96,54 @@ defmodule Matterlix.Matter.NIF do
   def nif_get_attribute(_context, _endpoint_id, _cluster_id, _attribute_id) do
     :erlang.nif_error(:nif_not_loaded)
   end
+
+  @doc """
+  Open the commissioning window to allow pairing.
+  """
+  @spec nif_open_commissioning_window(reference(), integer()) :: :ok | {:error, atom()}
+  def nif_open_commissioning_window(_context, _timeout_seconds) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  @doc """
+  Get the setup payload (QR code string and manual pairing code).
+  """
+  @spec nif_get_setup_payload(reference()) :: {:ok, map()} | {:error, atom()}
+  def nif_get_setup_payload(_context) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  @doc """
+  Register the calling process to receive Matter events.
+  """
+  @spec nif_register_callback(reference()) :: :ok | {:error, atom()}
+  def nif_register_callback(_context) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  @doc """
+  Schedule a factory reset of the device.
+  """
+  @spec nif_factory_reset(reference()) :: :ok | {:error, atom()}
+  def nif_factory_reset(_context) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  @doc """
+  Set device metadata (Vendor ID, Product ID, etc.).
+  Must be called before starting the server.
+  """
+  @spec nif_set_device_info(reference(), integer(), integer(), integer(), binary()) :: :ok | {:error, atom()}
+  def nif_set_device_info(_context, _vid, _pid, _software_ver, _serial_number) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  @doc """
+  Report the result of a WiFi connection attempt (Network Commissioning).
+  Called by Elixir in response to a {:connect_network, ...} message.
+  """
+  @spec nif_wifi_connect_result(reference(), integer()) :: :ok | {:error, atom()}
+  def nif_wifi_connect_result(_context, _status) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
 end

@@ -20,6 +20,9 @@ BUILD = $(MIX_APP_PATH)/obj
 # Matter SDK integration (disabled by default for stub builds)
 MATTER_SDK_ENABLED ?= 0
 
+# AddressSanitizer for security/memory testing
+ASAN ?= 0
+
 # Erlang paths - detect automatically if not set
 ERL_INCLUDE_DIR ?= $(shell erl -noshell -eval 'io:format("~s/erts-~s/include", [code:root_dir(), erlang:system_info(version)])' -s init stop)
 
@@ -42,6 +45,13 @@ CFLAGS += -fPIC
 CXXFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
 CXXFLAGS += -I$(ERL_INCLUDE_DIR) -I./c_src
 CXXFLAGS += -fPIC -std=c++17
+
+# Enable ASan if requested
+ifeq ($(ASAN),1)
+	CFLAGS += -fsanitize=address -g -fno-omit-frame-pointer
+	CXXFLAGS += -fsanitize=address -g -fno-omit-frame-pointer
+	LDFLAGS += -fsanitize=address
+endif
 
 # Platform-specific linker flags
 UNAME_S := $(shell uname -s)

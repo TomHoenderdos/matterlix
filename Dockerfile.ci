@@ -1,0 +1,52 @@
+# Dockerfile.ci
+# Linux CI environment for Matterlix with AddressSanitizer support
+
+FROM elixir:1.18
+
+# Install build dependencies
+# - build-essential: GCC/Make
+# - clang/llvm: For ASan support (often better than GCC's on some distros, but GCC works too)
+# - git: For fetching deps
+# - cmake, ninja-build, python3: For Matter SDK (future proofing)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    clang \
+    llvm \
+    git \
+    cmake \
+    ninja-build \
+    python3 \
+    python3-venv \
+    python3-pip \
+    pkg-config \
+    libssl-dev \
+    libmnl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Install Hex + Rebar
+RUN mix local.hex --force && \
+    mix local.rebar --force && \
+    mix archive.install hex nerves_bootstrap "~> 1.14" --force
+
+# Copy dependency files first (caching layer)
+COPY mix.exs mix.lock ./
+RUN mix deps.get
+
+# Copy the rest of the project
+COPY . .
+
+# Default command: Run tests with ASan enabled
+# We use CC=clang CXX=clang++ to ensure we use the compiler we installed for ASan consistency
+# Default command: Run tests with ASan enabled
+# We disable leak detection because the Erlang VM and build tools have known benign leaks/management patterns
+CMD export ASAN_LIB=$(find /usr/lib/llvm-*/lib/clang/*/lib/linux -name "libclang_rt.asan-*.so" | grep -v "preinit" | head -n 1) && \
+    if [ -z "$ASAN_LIB" ]; then echo "ASan lib not found"; exit 1; fi && \
+    echo "Preloading ASan lib: $ASAN_LIB" && \
+    export ASAN_OPTIONS=detect_leaks=0 && \
+    export CC=clang && \
+    export CXX=clang++ && \
+    export ASAN=1 && \
+    LD_PRELOAD="$ASAN_LIB" mix test

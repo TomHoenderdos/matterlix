@@ -12,13 +12,13 @@ This project bridges the Matter C++ SDK with Elixir/Nerves using Native Implemen
 ┌─────────────────────────────────────────────────────┐
 │                   Elixir Application                │
 │  ┌───────────────┐    ┌──────────────────────────┐  │
-│  │   Matterlix   │───▶│ Matterlix.Matter      │  │
+│  │   Matterlix   │───▶│ Matterlix.Matter         │  │
 │  │  (Your App)   │    │ (GenServer API)          │  │
 │  └───────────────┘    └──────────────────────────┘  │
 │                              │                      │
 │                              ▼                      │
 │                       ┌──────────────────────────┐  │
-│                       │ Matterlix.Matter.NIF  │  │
+│                       │ Matterlix.Matter.NIF     │  │
 │                       │ (Elixir NIF Bindings)    │  │
 │                       └──────────────────────────┘  │
 └───────────────────────────────┬─────────────────────┘
@@ -46,6 +46,10 @@ This project bridges the Matter C++ SDK with Elixir/Nerves using Native Implemen
 - **Elixir GenServer API** - Idiomatic Elixir interface for Matter operations
 - **Cross-compilation ready** - Build for Raspberry Pi targets with Nerves
 - **Stub mode** - Develop and test without Matter SDK dependency
+- **Commissioning Support** - QR Code generation, Commissioning Window management
+- **Network Commissioning** - WiFi credential passing to Elixir (for VintageNet integration)
+- **Attribute Callbacks** - Real-time Elixir events when attributes change
+- **Device Management** - Factory Reset, Device Info configuration
 
 ## Prerequisites
 
@@ -127,47 +131,50 @@ mix firmware
 mix burn  # Insert SD card
 ```
 
-## Project Structure
+## Testing & Security
 
-```
-matterlix/
-├── c_src/
-│   └── matter_nif.cpp          # C++ NIF implementation
-├── lib/
-│   └── matterlix/
-│       ├── application.ex      # OTP Application
-│       ├── matter.ex           # GenServer API
-│       └── matter/
-│           └── nif.ex          # NIF bindings
-├── deps/
-│   └── connectedhomeip/        # Matter SDK (not committed)
-├── Makefile                    # NIF build configuration
-├── matter_sdk_includes.mk      # Matter SDK paths
-└── mix.exs                     # Elixir project config
+### AddressSanitizer (ASan)
+
+To test for memory safety issues in the C++ NIF:
+
+```bash
+ASAN=1 mix test
 ```
 
-## API
+### Docker CI
 
-### Initialize Matter
+To run the full test suite with ASan in a Linux environment (bypassing macOS SIP issues):
+
+```bash
+./run_ci.sh
+```
+
+## API Examples
+
+### Initialize & Commission
 
 ```elixir
-{:ok, pid} = Matterlix.Matter.start_link([])
+{:ok, ctx} = Matterlix.Matter.NIF.nif_init()
+:ok = Matterlix.Matter.NIF.nif_register_callback(ctx)
+
+# Get pairing info
+{:ok, payload} = Matterlix.Matter.NIF.nif_get_setup_payload(ctx)
+IO.puts "QR Code: #{payload.qr_code}"
+
+# Allow pairing for 5 minutes
+:ok = Matterlix.Matter.NIF.nif_open_commissioning_window(ctx, 300)
+
+:ok = Matterlix.Matter.NIF.nif_start_server(ctx)
 ```
 
-### Start Matter Server
-
-```elixir
-:ok = Matterlix.Matter.start_server(pid)
-```
-
-### Get/Set Attributes
+### Attributes
 
 ```elixir
 # Read an attribute (endpoint 1, On/Off cluster, OnOff attribute)
-{:ok, value} = Matterlix.Matter.get_attribute(pid, 1, 0x0006, 0x0000)
+{:ok, value} = Matterlix.Matter.NIF.nif_get_attribute(ctx, 1, 0x0006, 0x0000)
 
 # Set an attribute
-:ok = Matterlix.Matter.set_attribute(pid, 1, 0x0006, 0x0000, true)
+:ok = Matterlix.Matter.NIF.nif_set_attribute(ctx, 1, 0x0006, 0x0000, true)
 ```
 
 ## Configuration
@@ -177,6 +184,7 @@ matterlix/
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MATTER_SDK_ENABLED` | Enable Matter SDK integration | `0` |
+| `ASAN` | Enable AddressSanitizer for memory safety | `0` |
 | `MIX_TARGET` | Nerves target (rpi3, rpi4, host) | `host` |
 | `CROSSCOMPILE` | Enable cross-compilation | auto |
 
@@ -186,10 +194,12 @@ matterlix/
 - [x] NIF skeleton with elixir_make
 - [x] Matter SDK build integration
 - [x] Host compilation (macOS/Linux)
-- [ ] Matter SDK function implementations
-- [ ] Device attestation & commissioning
-- [ ] Cross-compilation for ARM
-- [ ] Tested on Raspberry Pi hardware
+- [x] Matter SDK function implementations (Init, Start, Stop)
+- [x] Device Commissioning (QR, Window)
+- [x] Attribute Management (Get/Set/Callbacks)
+- [x] Network Commissioning (WiFi)
+- [x] Security Testing (ASan + CI)
+- [ ] Cross-compilation for ARM (Verified on HW)
 
 ## Resources
 
