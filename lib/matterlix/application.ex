@@ -1,4 +1,4 @@
-defmodule MatterNerves.Application do
+defmodule Matterlix.Application do
   # See https://hexdocs.pm/elixir/Application.html
   # for more information on OTP Applications
   @moduledoc false
@@ -10,13 +10,13 @@ defmodule MatterNerves.Application do
     children =
       [
         # Children for all targets
-        # Starts a worker by calling: MatterNerves.Worker.start_link(arg)
-        # {MatterNerves.Worker, arg},
+        # Starts a worker by calling: Matterlix.Worker.start_link(arg)
+        # {Matterlix.Worker, arg},
       ] ++ target_children()
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
-    opts = [strategy: :one_for_one, name: MatterNerves.Supervisor]
+    opts = [strategy: :one_for_one, name: Matterlix.Supervisor]
     Supervisor.start_link(children, opts)
   end
 

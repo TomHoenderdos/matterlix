@@ -264,4 +264,4 @@ static int nif_upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data, E
 }
 
 // NIF initialization macro
-ERL_NIF_INIT(Elixir.MatterNerves.Matter.NIF, nif_funcs, nif_load, nullptr, nif_upgrade, nullptr)
+ERL_NIF_INIT(Elixir.Matterlix.Matter.NIF, nif_funcs, nif_load, nullptr, nif_upgrade, nullptr)

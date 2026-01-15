@@ -1,6 +1,6 @@
-defmodule MatterNerves do
+defmodule Matterlix do
   @moduledoc """
-  Documentation for `MatterNerves`.
+  Documentation for `Matterlix`.
   """
 
   @doc """
@@ -8,7 +8,7 @@ defmodule MatterNerves do
 
   ## Examples
 
-      iex> MatterNerves.hello()
+      iex> Matterlix.hello()
       :world
 
   """

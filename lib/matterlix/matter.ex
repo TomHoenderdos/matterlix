@@ -1,4 +1,4 @@
-defmodule MatterNerves.Matter do
+defmodule Matterlix.Matter do
   @moduledoc """
   High-level Elixir API for Matter SDK integration.
 
@@ -9,13 +9,13 @@ defmodule MatterNerves.Matter do
   ## Example
 
       # Start the Matter server
-      {:ok, pid} = MatterNerves.Matter.start_link()
+      {:ok, pid} = Matterlix.Matter.start_link()
 
       # Get device info
-      {:ok, info} = MatterNerves.Matter.get_info(pid)
+      {:ok, info} = Matterlix.Matter.get_info(pid)
 
       # Set an attribute (e.g., turn on a light)
-      :ok = MatterNerves.Matter.set_attribute(pid, 1, 0x0006, 0x0000, true)
+      :ok = Matterlix.Matter.set_attribute(pid, 1, 0x0006, 0x0000, true)
 
   ## Matter Concepts
 
@@ -37,7 +37,7 @@ defmodule MatterNerves.Matter do
   use GenServer
   require Logger
 
-  alias MatterNerves.Matter.NIF
+  alias Matterlix.Matter.NIF
 
   defstruct [:context, :started]
 

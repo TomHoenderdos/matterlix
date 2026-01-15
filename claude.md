@@ -10,7 +10,7 @@ This project integrates the Matter (formerly Project CHIP) C++ SDK into a Nerves
 - [x] Nerves project structure created
 - [x] NIF infrastructure with `elixir_make`
 - [x] C++ NIF skeleton (`c_src/matter_nif.cpp`)
-- [x] Elixir wrapper modules (`MatterNerves.Matter` and `MatterNerves.Matter.NIF`)
+- [x] Elixir wrapper modules (`Matterlix.Matter` and `Matterlix.Matter.NIF`)
 - [x] Basic NIF functions: init, start_server, stop_server, get_info, set/get_attribute
 - [x] Build system with cross-compilation support
 - [x] Matter SDK downloaded and built (`deps/connectedhomeip`)
@@ -26,11 +26,11 @@ This project integrates the Matter (formerly Project CHIP) C++ SDK into a Nerves
 ## Project Structure
 
 ```
-matter_nerves/
+matterlix/
 ├── c_src/
 │   └── matter_nif.cpp      # C++ NIF code (Matter SDK bindings)
 ├── lib/
-│   └── matter_nerves/
+│   └── matterlix/
 │       ├── matter.ex       # High-level GenServer API
 │       └── matter/
 │           └── nif.ex      # Low-level NIF bindings
@@ -50,7 +50,7 @@ mix deps.get
 mix compile
 
 # Test NIF (stub)
-mix run -e '{:ok, ctx} = MatterNerves.Matter.NIF.nif_init(); IO.inspect(MatterNerves.Matter.NIF.nif_get_info(ctx))'
+mix run -e '{:ok, ctx} = Matterlix.Matter.NIF.nif_init(); IO.inspect(Matterlix.Matter.NIF.nif_get_info(ctx))'
 
 # Build with Matter SDK enabled (requires Matter SDK to be built first)
 MATTER_SDK_ENABLED=1 mix compile

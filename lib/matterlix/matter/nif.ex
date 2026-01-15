@@ -1,16 +1,16 @@
-defmodule MatterNerves.Matter.NIF do
+defmodule Matterlix.Matter.NIF do
   @moduledoc """
   Low-level NIF bindings for the Matter SDK.
 
   This module provides direct access to the C++ NIF functions.
-  For a higher-level API, use `MatterNerves.Matter` instead.
+  For a higher-level API, use `Matterlix.Matter` instead.
   """
 
   @on_load :load_nif
 
   @doc false
   def load_nif do
-    nif_path = :filename.join(:code.priv_dir(:matter_nerves), ~c"matter_nif")
+    nif_path = :filename.join(:code.priv_dir(:matterlix), ~c"matter_nif")
 
     case :erlang.load_nif(nif_path, 0) do
       :ok ->

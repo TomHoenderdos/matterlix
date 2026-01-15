@@ -1,7 +1,7 @@
-defmodule MatterNerves.MixProject do
+defmodule Matterlix.MixProject do
   use Mix.Project
 
-  @app :matter_nerves
+  @app :matterlix
   @version "0.1.0"
   @all_targets [:bbb, :grisp2, :osd32mp1, :mangopi_mq_pro, :qemu_aarch64, :rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
 
@@ -39,7 +39,7 @@ defmodule MatterNerves.MixProject do
   def application do
     [
       extra_applications: [:logger, :runtime_tools],
-      mod: {MatterNerves.Application, []}
+      mod: {Matterlix.Application, []}
     ]
   end
 
