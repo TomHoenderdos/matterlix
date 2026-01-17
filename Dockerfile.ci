@@ -42,7 +42,7 @@ COPY . .
 # We use CC=clang CXX=clang++ to ensure we use the compiler we installed for ASan consistency
 # Default command: Run tests with ASan enabled
 # We disable leak detection because the Erlang VM and build tools have known benign leaks/management patterns
-CMD export ASAN_LIB=$(find /usr/lib/llvm-*/lib/clang/*/lib/linux -name "libclang_rt.asan-*.so" | grep -v "preinit" | head -n 1) && \
+CMD export ASAN_LIB=$(find /usr/lib/llvm-*/lib/clang/*/lib/linux -name "libclang_rt.asan-x86_64.so" | head -n 1) && \
     if [ -z "$ASAN_LIB" ]; then echo "ASan lib not found"; exit 1; fi && \
     echo "Preloading ASan lib: $ASAN_LIB" && \
     export ASAN_OPTIONS=detect_leaks=0 && \

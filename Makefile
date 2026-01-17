@@ -50,7 +50,8 @@ CXXFLAGS += -fPIC -std=c++17
 ifeq ($(ASAN),1)
 	CFLAGS += -fsanitize=address -g -fno-omit-frame-pointer
 	CXXFLAGS += -fsanitize=address -g -fno-omit-frame-pointer
-	LDFLAGS += -fsanitize=address
+	# Use shared-libasan so the NIF can load with LD_PRELOAD'd ASan runtime
+	LDFLAGS += -fsanitize=address -shared-libasan
 endif
 
 # Platform-specific linker flags
