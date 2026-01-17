@@ -35,6 +35,15 @@ static ErlNifResourceType* MATTER_CONTEXT_RESOURCE = nullptr;
 #if MATTER_SDK_ENABLED
 class NervesWiFiDriver : public chip::DeviceLayer::NetworkCommissioning::WiFiDriver {
 public:
+    // Storage for credentials between AddOrUpdateNetwork and ConnectNetwork
+    static constexpr size_t kMaxSSIDLength = 32;
+    static constexpr size_t kMaxCredentialsLength = 64;
+    uint8_t mSavedSSID[kMaxSSIDLength];
+    size_t mSavedSSIDLength = 0;
+    uint8_t mSavedCredentials[kMaxCredentialsLength];
+    size_t mSavedCredentialsLength = 0;
+    bool mHasNetwork = false;
+
     void Init(chip::DeviceLayer::NetworkCommissioning::BaseDriver::NetworkStatusChangeCallback * statusChangeCallback) override { }
     void Shutdown() override { }
     uint8_t GetMaxNetworks() override { return 1; }
@@ -46,27 +55,39 @@ public:
     CHIP_ERROR ScanNetworks(chip::ByteSpan ssid, WiFiDriver::ScanCallback * callback) override;
     CHIP_ERROR ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::ConnectCallback * callback) override;
 
-    size_t GetNetworksSize() override { return 0; }
+    size_t GetNetworksSize() override { return mHasNetwork ? 1 : 0; }
     const chip::DeviceLayer::NetworkCommissioning::Network * GetNetworks() override { return nullptr; }
-    
+
     CHIP_ERROR AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteSpan credentials,
                                   chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) override {
+        // Store credentials for later use in ConnectNetwork
+        mSavedSSIDLength = std::min(ssid.size(), kMaxSSIDLength);
+        memcpy(mSavedSSID, ssid.data(), mSavedSSIDLength);
+
+        mSavedCredentialsLength = std::min(credentials.size(), kMaxCredentialsLength);
+        memcpy(mSavedCredentials, credentials.data(), mSavedCredentialsLength);
+        mHasNetwork = true;
+
+        // Notify Elixir about the new network
         if (g_matter_context && g_matter_context->has_listener) {
             ErlNifEnv* msg_env = enif_alloc_env();
-            
-            ERL_NIF_TERM ssid_term, cred_term;
-            unsigned char* buf;
-            
-            buf = enif_make_new_binary(msg_env, ssid.size(), &ssid_term);
-            memcpy(buf, ssid.data(), ssid.size());
-            
-            buf = enif_make_new_binary(msg_env, credentials.size(), &cred_term);
-            memcpy(buf, credentials.data(), credentials.size());
+            if (msg_env) {
+                ERL_NIF_TERM ssid_term, cred_term;
+                unsigned char* buf;
 
-            ERL_NIF_TERM msg = enif_make_tuple3(msg_env, ATOM(msg_env, "add_network"), ssid_term, cred_term);
-            enif_send(NULL, &g_matter_context->listener_pid, msg_env, msg);
-            enif_free_env(msg_env);
+                buf = enif_make_new_binary(msg_env, ssid.size(), &ssid_term);
+                memcpy(buf, ssid.data(), ssid.size());
+
+                buf = enif_make_new_binary(msg_env, credentials.size(), &cred_term);
+                memcpy(buf, credentials.data(), credentials.size());
+
+                ERL_NIF_TERM msg = enif_make_tuple3(msg_env, ATOM(msg_env, "add_network"), ssid_term, cred_term);
+                enif_send(NULL, &g_matter_context->listener_pid, msg_env, msg);
+                enif_free_env(msg_env);
+            }
         }
+
+        outNetworkIndex = 0;
         return CHIP_NO_ERROR;
     }
     CHIP_ERROR RemoveNetwork(chip::ByteSpan ssid, chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) override {
@@ -124,28 +145,21 @@ CHIP_ERROR NervesWiFiDriver::ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::Con
     mpConnectCallback = callback;
 
     ErlNifEnv* msg_env = enif_alloc_env();
-    
-    // Copy SSID and Credentials (Password)
+    if (!msg_env) {
+        return CHIP_ERROR_NO_MEMORY;
+    }
+
+    // Copy SSID
     ERL_NIF_TERM ssid_term, cred_term;
     unsigned char* ssid_buf = enif_make_new_binary(msg_env, ssid.size(), &ssid_term);
     memcpy(ssid_buf, ssid.data(), ssid.size());
-    
-    // The credentials span usually contains the password
-    // Note: Credentials might be larger than simple string (TLV), but for WiFi it's usually just the passphrase
-    // In real implementation, check if it's WPA/WPA2 vs open
-    chip::ByteSpan credentials = chip::DeviceLayer::Internal::NetworkCommissioning::GetInstance().GetCredentials();
-    // Wait, GetCredentials helper might be needed?
-    // Actually, ConnectNetwork signature *used* to take credentials in older SDKs.
-    // In newer SDKs, credentials are set via AddOrUpdateNetwork. 
-    // BUT! Since we returned CHIP_NO_ERROR in AddOrUpdateNetwork without saving, we don't have them.
-    // We should have saved them in AddOrUpdateNetwork?
-    
-    // Let's adjust: Nerves implementation implies we get AddOrUpdateNetwork -> Save to Elixir -> ConnectNetwork -> trigger connect.
-    // If AddOrUpdateNetwork is called first, we should send that to Elixir too?
-    
-    // Or simpler: We should implement AddOrUpdateNetwork to send the credentials to Elixir!
-    
-    ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ATOM(msg_env, "connect_network"), ssid_term);
+
+    // Include saved credentials from AddOrUpdateNetwork
+    unsigned char* cred_buf = enif_make_new_binary(msg_env, mSavedCredentialsLength, &cred_term);
+    memcpy(cred_buf, mSavedCredentials, mSavedCredentialsLength);
+
+    // Send 3-tuple: {:connect_network, ssid, credentials}
+    ERL_NIF_TERM msg = enif_make_tuple3(msg_env, ATOM(msg_env, "connect_network"), ssid_term, cred_term);
     enif_send(NULL, &g_matter_context->listener_pid, msg_env, msg);
     enif_free_env(msg_env);
 
@@ -570,11 +584,90 @@ static ERL_NIF_TERM nif_set_device_info(ErlNifEnv* env, int argc, const ERL_NIF_
 }
 
 /**
+ * NIF: set_commissioning_info/3
+ * Set the setup PIN code and discriminator for commissioning.
+ * Must be called before start_server for the values to take effect.
+ *
+ * Args: context, setup_pin (0-99999999), discriminator (0-4095)
+ * Returns: :ok | {:error, reason}
+ */
+static ERL_NIF_TERM nif_set_commissioning_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    MatterContext* ctx;
+    unsigned int setup_pin, discriminator;
+
+    if (!enif_get_resource(env, argv[0], MATTER_CONTEXT_RESOURCE, (void**)&ctx)) {
+        return ERROR_TUPLE(env, "invalid_context");
+    }
+
+    if (!enif_get_uint(env, argv[1], &setup_pin) ||
+        !enif_get_uint(env, argv[2], &discriminator)) {
+        return ERROR_TUPLE(env, "invalid_args");
+    }
+
+    // Validate PIN code (must be 00000001-99999998, excluding invalid patterns)
+    if (setup_pin == 0 || setup_pin > 99999998) {
+        return ERROR_TUPLE(env, "invalid_pin");
+    }
+
+    // Validate discriminator (12-bit value, 0-4095)
+    if (discriminator > 4095) {
+        return ERROR_TUPLE(env, "invalid_discriminator");
+    }
+
+#if MATTER_SDK_ENABLED
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+
+    CHIP_ERROR err = chip::DeviceLayer::ConfigurationMgr().StoreSetupPinCode(setup_pin);
+    if (err != CHIP_NO_ERROR) {
+        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+        return ERROR_TUPLE(env, "store_pin_failed");
+    }
+
+    err = chip::DeviceLayer::ConfigurationMgr().StoreSetupDiscriminator(discriminator);
+    if (err != CHIP_NO_ERROR) {
+        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+        return ERROR_TUPLE(env, "store_discriminator_failed");
+    }
+
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+#endif
+
+    return OK(env);
+}
+
+/**
  * NIF: wifi_connect_result/2
  * Callback from Elixir with result of WiFi connection attempt.
+ *
+ * Args: context, status (0 = success, non-zero = failure)
+ * Returns: :ok | {:error, reason}
  */
 static ERL_NIF_TERM nif_wifi_connect_result(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    // TODO: Pass this result to the pending NetworkCommissioning callback
+    MatterContext* ctx;
+    int status;
+
+    if (!enif_get_resource(env, argv[0], MATTER_CONTEXT_RESOURCE, (void**)&ctx)) {
+        return ERROR_TUPLE(env, "invalid_context");
+    }
+    if (!enif_get_int(env, argv[1], &status)) {
+        return ERROR_TUPLE(env, "invalid_args");
+    }
+
+#if MATTER_SDK_ENABLED
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+
+    if (ctx->wifi_driver && ctx->wifi_driver->mpConnectCallback) {
+        chip::DeviceLayer::NetworkCommissioning::Status connStatus =
+            (status == 0) ? chip::DeviceLayer::NetworkCommissioning::Status::kSuccess
+                          : chip::DeviceLayer::NetworkCommissioning::Status::kNetworkNotFound;
+
+        ctx->wifi_driver->mpConnectCallback->OnResult(connStatus, chip::CharSpan(), 0);
+        ctx->wifi_driver->mpConnectCallback = nullptr;
+    }
+
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+#endif
+
     return OK(env);
 }
 
@@ -591,6 +684,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_register_callback", 1, nif_register_callback, 0},
     {"nif_factory_reset", 1, nif_factory_reset, 0},
     {"nif_set_device_info", 5, nif_set_device_info, 0},
+    {"nif_set_commissioning_info", 3, nif_set_commissioning_info, 0},
     {"nif_wifi_connect_result", 2, nif_wifi_connect_result, 0},
 };
 
