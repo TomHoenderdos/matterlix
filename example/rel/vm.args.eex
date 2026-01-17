@@ -1,0 +1,15 @@
+## Customize flags given to the VM: https://www.erlang.org/doc/man/erl.html
+## Do not add -epmd_module here. See rootfs_overlay/etc/erl_inetrc.
+
+## Distillery requires the -name flag to be set, and the -setcookie flag to be set.
+## Be careful about changing the cookie string. Make sure you know the consequences.
+-name example@nerves.local
+-setcookie <%= @release.options[:cookie] %>
+
+## Start the Elixir shell after release booting
+-user elixir
+-run elixir start_cli
+
+## When running a release without EPMD
+-start_epmd false
+-erl_epmd_port 4369
