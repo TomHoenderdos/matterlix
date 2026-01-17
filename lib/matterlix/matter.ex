@@ -37,6 +37,9 @@ defmodule Matterlix.Matter do
   use GenServer
   require Logger
 
+  # Suppress warnings for modules only available on Nerves targets
+  @compile {:no_warn_undefined, [VintageNet, VintageNetWiFi]}
+
   alias Matterlix.Matter.NIF
 
   # WiFi commissioning configuration
