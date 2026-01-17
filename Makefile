@@ -54,13 +54,19 @@ ifeq ($(ASAN),1)
 endif
 
 # Platform-specific linker flags
-UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
-	LDFLAGS += -undefined dynamic_lookup -dynamiclib
-	NIF_EXT = so
-else
+# When cross-compiling, always use Linux flags regardless of host OS
+ifeq ($(CROSSCOMPILE),1)
 	LDFLAGS += -shared
 	NIF_EXT = so
+else
+	UNAME_S := $(shell uname -s)
+	ifeq ($(UNAME_S),Darwin)
+		LDFLAGS += -undefined dynamic_lookup -dynamiclib
+		NIF_EXT = so
+	else
+		LDFLAGS += -shared
+		NIF_EXT = so
+	endif
 endif
 
 # Include Matter SDK configuration if enabled
