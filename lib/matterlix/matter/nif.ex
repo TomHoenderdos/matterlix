@@ -76,7 +76,13 @@ defmodule Matterlix.Matter.NIF do
   - `attribute_id` - The attribute ID within the cluster
   - `value` - The value to set
   """
-  @spec nif_set_attribute(reference(), non_neg_integer(), non_neg_integer(), non_neg_integer(), term()) ::
+  @spec nif_set_attribute(
+          reference(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          term()
+        ) ::
           :ok | {:error, atom()}
   def nif_set_attribute(_context, _endpoint_id, _cluster_id, _attribute_id, _value) do
     :erlang.nif_error(:nif_not_loaded)
@@ -133,7 +139,8 @@ defmodule Matterlix.Matter.NIF do
   Set device metadata (Vendor ID, Product ID, etc.).
   Must be called before starting the server.
   """
-  @spec nif_set_device_info(reference(), integer(), integer(), integer(), binary()) :: :ok | {:error, atom()}
+  @spec nif_set_device_info(reference(), integer(), integer(), integer(), binary()) ::
+          :ok | {:error, atom()}
   def nif_set_device_info(_context, _vid, _pid, _software_ver, _serial_number) do
     :erlang.nif_error(:nif_not_loaded)
   end
@@ -144,6 +151,25 @@ defmodule Matterlix.Matter.NIF do
   """
   @spec nif_wifi_connect_result(reference(), integer()) :: :ok | {:error, atom()}
   def nif_wifi_connect_result(_context, _status) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  @doc """
+  Set the commissioning info (setup PIN and discriminator).
+  Must be called before starting the server for values to take effect.
+
+  ## Parameters
+  - `context` - The Matter context
+  - `setup_pin` - Setup PIN code (1-99999998, some values invalid)
+  - `discriminator` - 12-bit discriminator (0-4095)
+
+  ## Example
+
+      :ok = nif_set_commissioning_info(ctx, 20202021, 3840)
+  """
+  @spec nif_set_commissioning_info(reference(), non_neg_integer(), non_neg_integer()) ::
+          :ok | {:error, atom()}
+  def nif_set_commissioning_info(_context, _setup_pin, _discriminator) do
     :erlang.nif_error(:nif_not_loaded)
   end
 end

@@ -3,7 +3,21 @@ defmodule Matterlix.MixProject do
 
   @app :matterlix
   @version "0.1.0"
-  @all_targets [:bbb, :grisp2, :osd32mp1, :mangopi_mq_pro, :qemu_aarch64, :rpi, :rpi0, :rpi0_2, :rpi2, :rpi3, :rpi4, :rpi5, :x86_64]
+  @all_targets [
+    :bbb,
+    :grisp2,
+    :osd32mp1,
+    :mangopi_mq_pro,
+    :qemu_aarch64,
+    :rpi,
+    :rpi0,
+    :rpi0_2,
+    :rpi2,
+    :rpi3,
+    :rpi4,
+    :rpi5,
+    :x86_64
+  ]
 
   def project do
     [
@@ -18,7 +32,38 @@ defmodule Matterlix.MixProject do
       make_clean: ["clean"],
       make_env: make_env(Mix.target()),
       deps: deps(),
-      releases: [{@app, release()}]
+      releases: [{@app, release()}],
+      description: description(),
+      package: package(),
+      source_url: "https://github.com/tomHoenderdos/matterlix",
+      docs: docs()
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md", "CHANGELOG.md", "CONTRIBUTING.md", "LICENSE"],
+      source_url: "https://github.com/tomHoenderdos/matterlix",
+      source_ref: "v#{@version}",
+      groups_for_modules: [
+        "High-Level API": [Matterlix.Matter],
+        "Low-Level NIF": [Matterlix.Matter.NIF]
+      ]
+    ]
+  end
+
+  defp description do
+    "Elixir NIF bindings for the Matter (CHIP) SDK, designed for Nerves-based IoT devices"
+  end
+
+  defp package do
+    [
+      name: "matterlix",
+      licenses: ["Apache-2.0"],
+      links: %{
+        "GitHub" => "https://github.com/tomHoenderdos/matterlix"
+      }
     ]
   end
 
@@ -50,6 +95,9 @@ defmodule Matterlix.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      # Documentation
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+
       # Dependencies for all targets
       {:nerves, "~> 1.10", runtime: false},
       {:shoehorn, "~> 0.9.1"},
@@ -62,6 +110,9 @@ defmodule Matterlix.MixProject do
 
       # Dependencies for all targets except :host
       {:nerves_pack, "~> 0.7.1", targets: @all_targets},
+
+      # VintageNet WiFi for Matter network commissioning
+      {:vintage_net_wifi, "~> 0.12.0", targets: @all_targets},
 
       # Dependencies for specific targets
       # NOTE: It's generally low risk and recommended to follow minor version
