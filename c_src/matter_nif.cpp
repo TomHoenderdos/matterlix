@@ -42,15 +42,12 @@ static ErlNifResourceType* MATTER_CONTEXT_RESOURCE = nullptr;
 // Forward declaration for MatterContext
 struct MatterContext;
 
-// Global mutex pointer - intentionally leaked to avoid C++ static destructor race
+// Global mutex - using Meyer's singleton pattern for thread-safe initialization.
+// The mutex pointer is intentionally leaked to avoid C++ static destructor race
 // with BEAM shutdown. This is a well-known pattern for mixing C++ with Erlang NIFs.
-static std::mutex* g_nif_mutex = nullptr;
-
 static std::mutex& get_global_mutex() {
-    // Thread-safe initialization via static local (C++11 guarantees)
-    if (!g_nif_mutex) {
-        g_nif_mutex = new std::mutex();  // Intentionally never deleted
-    }
+    // C++11 guarantees thread-safe initialization of static locals
+    static std::mutex* g_nif_mutex = new std::mutex();  // Intentionally never deleted
     return *g_nif_mutex;
 }
 
@@ -67,9 +64,6 @@ struct MatterSingleton {
 };
 
 #if MATTER_SDK_ENABLED
-// Forward declaration needed for NervesWiFiDriver
-static MatterSingleton* get_singleton_unsafe();
-
 class NervesWiFiDriver : public chip::DeviceLayer::NetworkCommissioning::WiFiDriver {
 public:
     // Network storage structure
@@ -145,19 +139,17 @@ static NervesWiFiDriver g_wifi_driver;
 // Endpoint 0 is usually fine for network commissioning
 static chip::DeviceLayer::NetworkCommissioning::Instance g_wifi_commissioning_instance(0, &g_wifi_driver);
 
-// Helper to get singleton - caller must hold no locks (or handle carefully)
+// Global singleton pointer - protected by get_global_mutex()
 static MatterSingleton* g_singleton = nullptr;
 
-static MatterSingleton* get_singleton_unsafe() {
-    return g_singleton;
-}
-
-// Helper to safely get listener context for callbacks
+// Helper to safely get listener context for callbacks.
+// Acquires lock BEFORE reading g_singleton to avoid TOCTOU race condition.
 static bool get_listener_info(ErlNifPid* out_pid) {
-    MatterSingleton* singleton = get_singleton_unsafe();
+    std::lock_guard<std::mutex> lock(get_global_mutex());
+
+    MatterSingleton* singleton = g_singleton;
     if (!singleton) return false;
 
-    std::lock_guard<std::mutex> lock(MatterSingleton::mutex());
     if (singleton->owner_context && singleton->owner_context->has_listener) {
         *out_pid = singleton->owner_context->listener_pid;
         return true;
@@ -201,10 +193,18 @@ CHIP_ERROR NervesWiFiDriver::ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::Con
     // Copy SSID
     ERL_NIF_TERM ssid_term, cred_term;
     unsigned char* ssid_buf = enif_make_new_binary(msg_env, ssid.size(), &ssid_term);
+    if (!ssid_buf) {
+        enif_free_env(msg_env);
+        return CHIP_ERROR_NO_MEMORY;
+    }
     memcpy(ssid_buf, ssid.data(), ssid.size());
 
     // Include saved credentials from AddOrUpdateNetwork
     unsigned char* cred_buf = enif_make_new_binary(msg_env, mNetwork.credentialsLength, &cred_term);
+    if (!cred_buf) {
+        enif_free_env(msg_env);
+        return CHIP_ERROR_NO_MEMORY;
+    }
     memcpy(cred_buf, mNetwork.credentials, mNetwork.credentialsLength);
 
     // Send 3-tuple: {:connect_network, ssid, credentials}
@@ -234,9 +234,19 @@ CHIP_ERROR NervesWiFiDriver::AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteS
             unsigned char* buf;
 
             buf = enif_make_new_binary(msg_env, ssid.size(), &ssid_term);
+            if (!buf) {
+                enif_free_env(msg_env);
+                outNetworkIndex = 0;
+                return CHIP_NO_ERROR;  // Non-fatal: network stored, just couldn't notify
+            }
             memcpy(buf, ssid.data(), ssid.size());
 
             buf = enif_make_new_binary(msg_env, credentials.size(), &cred_term);
+            if (!buf) {
+                enif_free_env(msg_env);
+                outNetworkIndex = 0;
+                return CHIP_NO_ERROR;  // Non-fatal: network stored, just couldn't notify
+            }
             memcpy(buf, credentials.data(), credentials.size());
 
             ERL_NIF_TERM msg = enif_make_tuple3(msg_env, ATOM(msg_env, "add_network"), ssid_term, cred_term);
@@ -383,6 +393,10 @@ static ERL_NIF_TERM nif_stop_server(ErlNifEnv* env, int argc, const ERL_NIF_TERM
         return ERROR_TUPLE(env, "invalid_context");
     }
 
+    if (!ctx->initialized) {
+        return ERROR_TUPLE(env, "not_initialized");
+    }
+
 #if MATTER_SDK_ENABLED
     // Stop Matter server
     chip::Server::GetInstance().Shutdown();
@@ -429,8 +443,10 @@ static ERL_NIF_TERM nif_get_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     // Placeholder version info
     ERL_NIF_TERM version;
     unsigned char* version_data = enif_make_new_binary(env, 5, &version);
-    memcpy(version_data, "0.2.0", 5);
-    enif_make_map_put(env, info_map, ATOM(env, "nif_version"), version, &info_map);
+    if (version_data) {
+        memcpy(version_data, "0.2.0", 5);
+        enif_make_map_put(env, info_map, ATOM(env, "nif_version"), version, &info_map);
+    }
 
     return OK_TUPLE(env, info_map);
 }
@@ -463,28 +479,46 @@ static ERL_NIF_TERM nif_set_attribute(ErlNifEnv* env, int argc, const ERL_NIF_TE
 #if MATTER_SDK_ENABLED
     chip::DeviceLayer::PlatformMgr().LockChipStack();
 
+    EmberAfStatus write_status = EMBER_ZCL_STATUS_FAILURE;
+
     // Check value type and write to attribute storage
     // 1. Boolean (e.g. On/Off)
     char atom_buf[16];
     if (enif_is_atom(env, argv[4])) {
         if (enif_get_atom(env, argv[4], atom_buf, sizeof(atom_buf), ERL_NIF_LATIN1)) {
             bool val = (strcmp(atom_buf, "true") == 0);
-            emberAfWriteAttribute(endpoint_id, cluster_id, attribute_id, CLUSTER_MASK_SERVER,
+            write_status = emberAfWriteAttribute(endpoint_id, cluster_id, attribute_id, CLUSTER_MASK_SERVER,
                                   (uint8_t*)&val, ZCL_BOOLEAN_ATTRIBUTE_TYPE);
         }
     }
-    // 2. Integer (e.g. Level, Brightness)
+    // 2. Integer - determine appropriate size based on value
     else {
         unsigned int uint_val;
         if (enif_get_uint(env, argv[4], &uint_val)) {
-             // Assuming 8-bit unsigned for simplicity; can expand to check size
-             uint8_t val = (uint8_t)uint_val;
-             emberAfWriteAttribute(endpoint_id, cluster_id, attribute_id, CLUSTER_MASK_SERVER,
-                                   (uint8_t*)&val, ZCL_INT8U_ATTRIBUTE_TYPE);
+            if (uint_val <= 0xFF) {
+                // 8-bit value
+                uint8_t val = (uint8_t)uint_val;
+                write_status = emberAfWriteAttribute(endpoint_id, cluster_id, attribute_id, CLUSTER_MASK_SERVER,
+                                      (uint8_t*)&val, ZCL_INT8U_ATTRIBUTE_TYPE);
+            } else if (uint_val <= 0xFFFF) {
+                // 16-bit value
+                uint16_t val = (uint16_t)uint_val;
+                write_status = emberAfWriteAttribute(endpoint_id, cluster_id, attribute_id, CLUSTER_MASK_SERVER,
+                                      (uint8_t*)&val, ZCL_INT16U_ATTRIBUTE_TYPE);
+            } else {
+                // 32-bit value
+                uint32_t val = (uint32_t)uint_val;
+                write_status = emberAfWriteAttribute(endpoint_id, cluster_id, attribute_id, CLUSTER_MASK_SERVER,
+                                      (uint8_t*)&val, ZCL_INT32U_ATTRIBUTE_TYPE);
+            }
         }
     }
 
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+
+    if (write_status != EMBER_ZCL_STATUS_SUCCESS) {
+        return ERROR_TUPLE(env, "write_failed");
+    }
 #endif
 
     return OK(env);
@@ -530,16 +564,30 @@ static ERL_NIF_TERM nif_get_attribute(ErlNifEnv* env, int argc, const ERL_NIF_TE
     }
 
     // Convert to Elixir term based on type - use proper boolean atoms
+    // Use memcpy for all multi-byte values to avoid unaligned access on ARM
     if (data_type == ZCL_BOOLEAN_ATTRIBUTE_TYPE) {
         bool val = *data;
         return OK_TUPLE(env, val ? BOOL_TRUE(env) : BOOL_FALSE(env));
     } else if (data_type == ZCL_INT8U_ATTRIBUTE_TYPE) {
         return OK_TUPLE(env, enif_make_uint(env, *data));
+    } else if (data_type == ZCL_INT8S_ATTRIBUTE_TYPE) {
+        return OK_TUPLE(env, enif_make_int(env, (int8_t)*data));
     } else if (data_type == ZCL_INT16U_ATTRIBUTE_TYPE) {
-        // Use memcpy to avoid unaligned access on ARM
         uint16_t val;
         memcpy(&val, data, sizeof(val));
         return OK_TUPLE(env, enif_make_uint(env, val));
+    } else if (data_type == ZCL_INT16S_ATTRIBUTE_TYPE) {
+        int16_t val;
+        memcpy(&val, data, sizeof(val));
+        return OK_TUPLE(env, enif_make_int(env, val));
+    } else if (data_type == ZCL_INT32U_ATTRIBUTE_TYPE) {
+        uint32_t val;
+        memcpy(&val, data, sizeof(val));
+        return OK_TUPLE(env, enif_make_uint(env, val));
+    } else if (data_type == ZCL_INT32S_ATTRIBUTE_TYPE) {
+        int32_t val;
+        memcpy(&val, data, sizeof(val));
+        return OK_TUPLE(env, enif_make_int(env, val));
     }
 #endif
 
@@ -566,10 +614,15 @@ static ERL_NIF_TERM nif_open_commissioning_window(ErlNifEnv* env, int argc, cons
         return ERROR_TUPLE(env, "invalid_args");
     }
 
+    // Validate timeout is positive and fits in 16-bit seconds
+    if (timeout <= 0 || timeout > 65535) {
+        return ERROR_TUPLE(env, "invalid_timeout");
+    }
+
 #if MATTER_SDK_ENABLED
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     CHIP_ERROR err = chip::Server::GetInstance().GetCommissioningWindowManager().OpenBasicCommissioningWindow(
-        chip::System::Clock::Seconds16(timeout));
+        chip::System::Clock::Seconds16(static_cast<uint16_t>(timeout)));
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 
     if (err != CHIP_NO_ERROR) {
@@ -599,20 +652,28 @@ static ERL_NIF_TERM nif_get_setup_payload(ErlNifEnv* env, int argc, const ERL_NI
 #if MATTER_SDK_ENABLED
     chip::DeviceLayer::PlatformMgr().LockChipStack();
 
-    // Use standard utility to get payload strings
-    char qrCodeBuffer[128];
-    MutableCharSpan qrCode(qrCodeBuffer);
-    GetQRCode(qrCode, chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
+    // QR codes can be ~200 chars, manual codes up to 21 digits
+    // Use generous buffers and ensure null termination
+    char qrCodeBuffer[256] = {0};
+    chip::MutableCharSpan qrCode(qrCodeBuffer, sizeof(qrCodeBuffer) - 1);
+    CHIP_ERROR qrErr = GetQRCode(qrCode, chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
 
-    char manualCodeBuffer[32];
-    MutableCharSpan manualCode(manualCodeBuffer);
-    GetManualCode(manualCode, chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
+    char manualCodeBuffer[64] = {0};
+    chip::MutableCharSpan manualCode(manualCodeBuffer, sizeof(manualCodeBuffer) - 1);
+    CHIP_ERROR manualErr = GetManualCode(manualCode, chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
 
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 
-    // Add to map
-    ERL_NIF_TERM qr_val = enif_make_string(env, qrCode.data(), ERL_NIF_LATIN1);
-    ERL_NIF_TERM manual_val = enif_make_string(env, manualCode.data(), ERL_NIF_LATIN1);
+    // Ensure null termination (MutableCharSpan doesn't guarantee it)
+    qrCodeBuffer[qrCode.size()] = '\0';
+    manualCodeBuffer[manualCode.size()] = '\0';
+
+    // Add to map - use empty string if generation failed
+    const char* qr_str = (qrErr == CHIP_NO_ERROR) ? qrCodeBuffer : "";
+    const char* manual_str = (manualErr == CHIP_NO_ERROR) ? manualCodeBuffer : "";
+
+    ERL_NIF_TERM qr_val = enif_make_string(env, qr_str, ERL_NIF_LATIN1);
+    ERL_NIF_TERM manual_val = enif_make_string(env, manual_str, ERL_NIF_LATIN1);
 
     enif_make_map_put(env, info_map, ATOM(env, "qr_code"), qr_val, &info_map);
     enif_make_map_put(env, info_map, ATOM(env, "manual_code"), manual_val, &info_map);
@@ -646,6 +707,8 @@ static ERL_NIF_TERM nif_register_callback(ErlNifEnv* env, int argc, const ERL_NI
     ErlNifPid pid;
     enif_self(env, &pid);
 
+    // Synchronize with get_listener_info() which reads these fields
+    std::lock_guard<std::mutex> lock(get_global_mutex());
     ctx->listener_pid = pid;
     ctx->has_listener = true;
     ctx->monitor_active = false;
@@ -690,19 +753,31 @@ static ERL_NIF_TERM nif_set_device_info(ErlNifEnv* env, int argc, const ERL_NIF_
         return ERROR_TUPLE(env, "invalid_args");
     }
 
+    // Validate VID and PID are 16-bit values
+    if (vid > 0xFFFF) {
+        return ERROR_TUPLE(env, "invalid_vendor_id");
+    }
+    if (pid > 0xFFFF) {
+        return ERROR_TUPLE(env, "invalid_product_id");
+    }
+
+    // Validate serial number length (Matter spec allows up to 32 chars)
+    if (serial.size == 0 || serial.size > 32) {
+        return ERROR_TUPLE(env, "invalid_serial_number");
+    }
+
 #if MATTER_SDK_ENABLED
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     chip::DeviceLayer::ConfigurationMgr().StoreManufacturerDeviceId((uint16_t)vid);
     chip::DeviceLayer::ConfigurationMgr().StoreProductId((uint16_t)pid);
     chip::DeviceLayer::ConfigurationMgr().StoreSoftwareVersion((uint32_t)ver);
 
-    // Serial number handling
-    if (serial.size > 0 && serial.size < 32) {
-        char serial_buf[33];
-        memcpy(serial_buf, serial.data, serial.size);
-        serial_buf[serial.size] = '\0';
-        chip::DeviceLayer::ConfigurationMgr().StoreSerialNumber(serial_buf, serial.size);
-    }
+    // Serial number handling - already validated above
+    char serial_buf[33];
+    memcpy(serial_buf, serial.data, serial.size);
+    serial_buf[serial.size] = '\0';
+    chip::DeviceLayer::ConfigurationMgr().StoreSerialNumber(serial_buf, serial.size);
+
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 #endif
     return OK(env);
@@ -916,7 +991,10 @@ static void nif_unload(ErlNifEnv* env, void* priv_data) {
     MatterSingleton* singleton = static_cast<MatterSingleton*>(priv_data);
     if (singleton) {
 #if MATTER_SDK_ENABLED
-        g_singleton = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(get_global_mutex());
+            g_singleton = nullptr;
+        }
 #endif
         delete singleton;
     }
@@ -971,18 +1049,31 @@ void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & 
         return;
     }
 
-    // Decode value based on type (simplified for common types)
-    // Use proper Elixir boolean atoms
+    // Decode value based on type
+    // Use memcpy for all multi-byte values to avoid unaligned access on ARM
     ERL_NIF_TERM val_term;
     if (type == ZCL_BOOLEAN_ATTRIBUTE_TYPE) {
         val_term = (*value != 0) ? BOOL_TRUE(msg_env) : BOOL_FALSE(msg_env);
     } else if (type == ZCL_INT8U_ATTRIBUTE_TYPE) {
         val_term = enif_make_uint(msg_env, *value);
+    } else if (type == ZCL_INT8S_ATTRIBUTE_TYPE) {
+        val_term = enif_make_int(msg_env, (int8_t)*value);
     } else if (type == ZCL_INT16U_ATTRIBUTE_TYPE && size >= 2) {
-        // Use memcpy to avoid unaligned access on ARM
         uint16_t tmp;
         memcpy(&tmp, value, sizeof(tmp));
         val_term = enif_make_uint(msg_env, tmp);
+    } else if (type == ZCL_INT16S_ATTRIBUTE_TYPE && size >= 2) {
+        int16_t tmp;
+        memcpy(&tmp, value, sizeof(tmp));
+        val_term = enif_make_int(msg_env, tmp);
+    } else if (type == ZCL_INT32U_ATTRIBUTE_TYPE && size >= 4) {
+        uint32_t tmp;
+        memcpy(&tmp, value, sizeof(tmp));
+        val_term = enif_make_uint(msg_env, tmp);
+    } else if (type == ZCL_INT32S_ATTRIBUTE_TYPE && size >= 4) {
+        int32_t tmp;
+        memcpy(&tmp, value, sizeof(tmp));
+        val_term = enif_make_int(msg_env, tmp);
     } else {
         // Fallback for other types: return nil, signaling "query it yourself"
         val_term = ATOM(msg_env, "nil");
