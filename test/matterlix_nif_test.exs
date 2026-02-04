@@ -127,7 +127,8 @@ defmodule Matterlix.Matter.NIFTest do
       assert {:error, :invalid_pin} = NIF.nif_set_commissioning_info(ctx, 99_999_999, 3840)
 
       # Invalid discriminator (> 4095)
-      assert {:error, :invalid_discriminator} = NIF.nif_set_commissioning_info(ctx, 20_202_021, 5000)
+      assert {:error, :invalid_discriminator} =
+               NIF.nif_set_commissioning_info(ctx, 20_202_021, 5000)
     end
   end
 

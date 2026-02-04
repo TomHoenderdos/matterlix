@@ -181,6 +181,62 @@ IO.puts "QR Code: #{payload.qr_code}"
 :ok = Matterlix.Matter.NIF.nif_set_attribute(ctx, 1, 0x0006, 0x0000, true)
 ```
 
+## Complete Example
+
+The `example/` directory contains a fully working Matter light device with physical controls:
+
+```
+example/
+├── lib/
+│   ├── example/
+│   │   ├── matter_light.ex   # Matter device logic & attribute handling
+│   │   ├── pairing_button.ex # GPIO button with short/long press detection
+│   │   └── status_led.ex     # LED patterns for device state feedback
+│   └── example.ex            # Application supervisor
+└── config/
+    └── target.exs            # Raspberry Pi GPIO & commissioning config
+```
+
+### Run on Host (No Hardware Required)
+
+```bash
+cd example
+mix deps.get
+iex -S mix
+
+# Simulate button presses
+iex> Example.PairingButton.simulate_short_press()  # Toggle light
+iex> Example.PairingButton.simulate_long_press()   # Enter pairing mode
+
+# Check LED status
+iex> Example.StatusLed.set_mode(:pairing)  # Blink pattern
+iex> Example.StatusLed.set_mode(:paired)   # Solid on
+```
+
+### Deploy to Raspberry Pi
+
+```bash
+cd example
+export MIX_TARGET=rpi4
+mix deps.get
+mix firmware
+mix burn
+```
+
+**Wiring (BCM pin numbers):**
+- GPIO17 → Button (to GND, uses internal pull-up)
+- GPIO27 → LED anode (with 330Ω resistor to GND)
+
+### What It Demonstrates
+
+- **GenServer integration** - Clean separation between Matter and device logic
+- **Event handling** - React to attribute changes from Matter controllers
+- **Hardware abstraction** - Same code runs on host (simulated) and Raspberry Pi
+- **Commissioning flow** - Pairing button, status LED feedback, QR codes
+- **Graceful degradation** - Falls back to simulation when GPIO unavailable
+
+See `example/README.md` for detailed documentation.
+
 ## Configuration
 
 ### Environment Variables
