@@ -1,6 +1,8 @@
 # Matterlix
 
 [![CI](https://github.com/tomHoenderdos/matterlix/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tomHoenderdos/matterlix/actions/workflows/ci.yml)
+[![Hex.pm](https://img.shields.io/hexpm/v/matterlix.svg)](https://hex.pm/packages/matterlix)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/matterlix)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 A Nerves-based Elixir application that integrates the [Matter](https://csa-iot.org/all-solutions/matter/) (formerly Project CHIP) smart home protocol, enabling Raspberry Pi devices to participate in Matter networks.
