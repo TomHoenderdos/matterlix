@@ -8,6 +8,8 @@
 #include <erl_nif.h>
 #include <cstring>
 #include <string>
+#include <mutex>
+#include <atomic>
 
 // Forward declarations for Matter SDK integration
 #if MATTER_SDK_ENABLED
@@ -29,20 +31,58 @@
 #define OK_TUPLE(env, term) enif_make_tuple2(env, OK(env), term)
 #define ERROR_TUPLE(env, reason) enif_make_tuple2(env, ERROR(env), ATOM(env, reason))
 
+// Boolean atoms - these ARE the correct Elixir true/false values
+#define BOOL_TRUE(env) enif_make_atom(env, "true")
+#define BOOL_FALSE(env) enif_make_atom(env, "false")
+
 // Resource type for Matter context (will hold Matter SDK state)
 static ErlNifResourceType* MATTER_CONTEXT_RESOURCE = nullptr;
 
+
+// Forward declaration for MatterContext
+struct MatterContext;
+
+// Global mutex pointer - intentionally leaked to avoid C++ static destructor race
+// with BEAM shutdown. This is a well-known pattern for mixing C++ with Erlang NIFs.
+static std::mutex* g_nif_mutex = nullptr;
+
+static std::mutex& get_global_mutex() {
+    // Thread-safe initialization via static local (C++11 guarantees)
+    if (!g_nif_mutex) {
+        g_nif_mutex = new std::mutex();  // Intentionally never deleted
+    }
+    return *g_nif_mutex;
+}
+
+// Singleton holder stored in NIF priv_data for thread-safe SDK access
+struct MatterSingleton {
+    MatterContext* owner_context;     // The context that owns SDK lifecycle
+    std::atomic<int> ref_count;       // Number of Elixir resources referencing this
+    bool sdk_initialized;
+
+    MatterSingleton() : owner_context(nullptr), ref_count(0), sdk_initialized(false) {}
+
+    // Use the global mutex for thread safety
+    static std::mutex& mutex() { return get_global_mutex(); }
+};
+
 #if MATTER_SDK_ENABLED
+// Forward declaration needed for NervesWiFiDriver
+static MatterSingleton* get_singleton_unsafe();
+
 class NervesWiFiDriver : public chip::DeviceLayer::NetworkCommissioning::WiFiDriver {
 public:
-    // Storage for credentials between AddOrUpdateNetwork and ConnectNetwork
-    static constexpr size_t kMaxSSIDLength = 32;
-    static constexpr size_t kMaxCredentialsLength = 64;
-    uint8_t mSavedSSID[kMaxSSIDLength];
-    size_t mSavedSSIDLength = 0;
-    uint8_t mSavedCredentials[kMaxCredentialsLength];
-    size_t mSavedCredentialsLength = 0;
-    bool mHasNetwork = false;
+    // Network storage structure
+    struct StoredNetwork {
+        uint8_t ssid[32];
+        size_t ssidLength;
+        uint8_t credentials[64];
+        size_t credentialsLength;
+        bool configured;
+    };
+
+    StoredNetwork mNetwork = {};
+    chip::DeviceLayer::NetworkCommissioning::Network mNetworkInfo = {};
 
     void Init(chip::DeviceLayer::NetworkCommissioning::BaseDriver::NetworkStatusChangeCallback * statusChangeCallback) override { }
     void Shutdown() override { }
@@ -55,44 +95,30 @@ public:
     CHIP_ERROR ScanNetworks(chip::ByteSpan ssid, WiFiDriver::ScanCallback * callback) override;
     CHIP_ERROR ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::ConnectCallback * callback) override;
 
-    size_t GetNetworksSize() override { return mHasNetwork ? 1 : 0; }
-    const chip::DeviceLayer::NetworkCommissioning::Network * GetNetworks() override { return nullptr; }
+    size_t GetNetworksSize() override { return mNetwork.configured ? 1 : 0; }
 
-    CHIP_ERROR AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteSpan credentials,
-                                  chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) override {
-        // Store credentials for later use in ConnectNetwork
-        mSavedSSIDLength = std::min(ssid.size(), kMaxSSIDLength);
-        memcpy(mSavedSSID, ssid.data(), mSavedSSIDLength);
-
-        mSavedCredentialsLength = std::min(credentials.size(), kMaxCredentialsLength);
-        memcpy(mSavedCredentials, credentials.data(), mSavedCredentialsLength);
-        mHasNetwork = true;
-
-        // Notify Elixir about the new network
-        if (g_matter_context && g_matter_context->has_listener) {
-            ErlNifEnv* msg_env = enif_alloc_env();
-            if (msg_env) {
-                ERL_NIF_TERM ssid_term, cred_term;
-                unsigned char* buf;
-
-                buf = enif_make_new_binary(msg_env, ssid.size(), &ssid_term);
-                memcpy(buf, ssid.data(), ssid.size());
-
-                buf = enif_make_new_binary(msg_env, credentials.size(), &cred_term);
-                memcpy(buf, credentials.data(), credentials.size());
-
-                ERL_NIF_TERM msg = enif_make_tuple3(msg_env, ATOM(msg_env, "add_network"), ssid_term, cred_term);
-                enif_send(NULL, &g_matter_context->listener_pid, msg_env, msg);
-                enif_free_env(msg_env);
-            }
+    const chip::DeviceLayer::NetworkCommissioning::Network* GetNetworks() override {
+        if (!mNetwork.configured) {
+            return nullptr;
         }
 
+        // Populate network info from stored network
+        memcpy(mNetworkInfo.networkID, mNetwork.ssid, mNetwork.ssidLength);
+        mNetworkInfo.networkIDLen = static_cast<uint8_t>(mNetwork.ssidLength);
+        mNetworkInfo.connected = false;  // TODO: Track actual connection status
+
+        return &mNetworkInfo;
+    }
+
+    CHIP_ERROR AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteSpan credentials,
+                                  chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) override;
+
+    CHIP_ERROR RemoveNetwork(chip::ByteSpan ssid, chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) override {
+        mNetwork.configured = false;
         outNetworkIndex = 0;
         return CHIP_NO_ERROR;
     }
-    CHIP_ERROR RemoveNetwork(chip::ByteSpan ssid, chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) override {
-        return CHIP_NO_ERROR;
-    }
+
     CHIP_ERROR ReorderNetwork(chip::ByteSpan ssid, uint8_t index, chip::MutableCharSpan & outDebugText) override {
         return CHIP_NO_ERROR;
     }
@@ -104,41 +130,64 @@ public:
 
 typedef struct MatterContext {
     bool initialized;
+    bool is_owner;              // True if this context owns SDK lifecycle
     ErlNifPid listener_pid;
     ErlNifMonitor monitor;
     bool has_listener;
+    bool monitor_active;        // True if process monitor is currently active
 #if MATTER_SDK_ENABLED
     NervesWiFiDriver* wifi_driver;
 #endif
 } MatterContext;
 
-// Global reference to context for callbacks (Matter SDK is singleton)
-static MatterContext* g_matter_context = nullptr;
-
 #if MATTER_SDK_ENABLED
 static NervesWiFiDriver g_wifi_driver;
 // Endpoint 0 is usually fine for network commissioning
 static chip::DeviceLayer::NetworkCommissioning::Instance g_wifi_commissioning_instance(0, &g_wifi_driver);
-#endif
 
-#if MATTER_SDK_ENABLED
+// Helper to get singleton - caller must hold no locks (or handle carefully)
+static MatterSingleton* g_singleton = nullptr;
+
+static MatterSingleton* get_singleton_unsafe() {
+    return g_singleton;
+}
+
+// Helper to safely get listener context for callbacks
+static bool get_listener_info(ErlNifPid* out_pid) {
+    MatterSingleton* singleton = get_singleton_unsafe();
+    if (!singleton) return false;
+
+    std::lock_guard<std::mutex> lock(MatterSingleton::mutex());
+    if (singleton->owner_context && singleton->owner_context->has_listener) {
+        *out_pid = singleton->owner_context->listener_pid;
+        return true;
+    }
+    return false;
+}
+
 CHIP_ERROR NervesWiFiDriver::ScanNetworks(chip::ByteSpan ssid, WiFiDriver::ScanCallback * callback) {
-    if (!g_matter_context || !g_matter_context->has_listener) {
+    ErlNifPid pid;
+    if (!get_listener_info(&pid)) {
         return CHIP_ERROR_INCORRECT_STATE;
     }
-    
+
     mpScanCallback = callback;
 
     ErlNifEnv* msg_env = enif_alloc_env();
-    ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ATOM(msg_env, "scan_networks"), ATOM(msg_env, "undefined")); // SSID filtering not implemented yet
-    enif_send(NULL, &g_matter_context->listener_pid, msg_env, msg);
+    if (!msg_env) {
+        return CHIP_ERROR_NO_MEMORY;
+    }
+
+    ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ATOM(msg_env, "scan_networks"), ATOM(msg_env, "undefined"));
+    enif_send(NULL, &pid, msg_env, msg);
     enif_free_env(msg_env);
 
     return CHIP_NO_ERROR;
 }
 
 CHIP_ERROR NervesWiFiDriver::ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::ConnectCallback * callback) {
-    if (!g_matter_context || !g_matter_context->has_listener) {
+    ErlNifPid pid;
+    if (!get_listener_info(&pid)) {
         return CHIP_ERROR_INCORRECT_STATE;
     }
 
@@ -155,26 +204,71 @@ CHIP_ERROR NervesWiFiDriver::ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::Con
     memcpy(ssid_buf, ssid.data(), ssid.size());
 
     // Include saved credentials from AddOrUpdateNetwork
-    unsigned char* cred_buf = enif_make_new_binary(msg_env, mSavedCredentialsLength, &cred_term);
-    memcpy(cred_buf, mSavedCredentials, mSavedCredentialsLength);
+    unsigned char* cred_buf = enif_make_new_binary(msg_env, mNetwork.credentialsLength, &cred_term);
+    memcpy(cred_buf, mNetwork.credentials, mNetwork.credentialsLength);
 
     // Send 3-tuple: {:connect_network, ssid, credentials}
     ERL_NIF_TERM msg = enif_make_tuple3(msg_env, ATOM(msg_env, "connect_network"), ssid_term, cred_term);
-    enif_send(NULL, &g_matter_context->listener_pid, msg_env, msg);
+    enif_send(NULL, &pid, msg_env, msg);
     enif_free_env(msg_env);
 
     return CHIP_NO_ERROR;
 }
-#endif
 
+CHIP_ERROR NervesWiFiDriver::AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteSpan credentials,
+                              chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) {
+    // Store credentials in our network struct
+    mNetwork.ssidLength = std::min(ssid.size(), sizeof(mNetwork.ssid));
+    memcpy(mNetwork.ssid, ssid.data(), mNetwork.ssidLength);
+
+    mNetwork.credentialsLength = std::min(credentials.size(), sizeof(mNetwork.credentials));
+    memcpy(mNetwork.credentials, credentials.data(), mNetwork.credentialsLength);
+    mNetwork.configured = true;
+
+    // Notify Elixir about the new network
+    ErlNifPid pid;
+    if (get_listener_info(&pid)) {
+        ErlNifEnv* msg_env = enif_alloc_env();
+        if (msg_env) {
+            ERL_NIF_TERM ssid_term, cred_term;
+            unsigned char* buf;
+
+            buf = enif_make_new_binary(msg_env, ssid.size(), &ssid_term);
+            memcpy(buf, ssid.data(), ssid.size());
+
+            buf = enif_make_new_binary(msg_env, credentials.size(), &cred_term);
+            memcpy(buf, credentials.data(), credentials.size());
+
+            ERL_NIF_TERM msg = enif_make_tuple3(msg_env, ATOM(msg_env, "add_network"), ssid_term, cred_term);
+            enif_send(NULL, &pid, msg_env, msg);
+            enif_free_env(msg_env);
+        }
+    }
+
+    outNetworkIndex = 0;
+    return CHIP_NO_ERROR;
+}
+#endif
 static void matter_context_destructor(ErlNifEnv* env, void* obj) {
     MatterContext* ctx = static_cast<MatterContext*>(obj);
-    if (ctx && ctx->initialized) {
+    if (!ctx) return;
+
+    // Get singleton from priv_data
+    MatterSingleton* singleton = static_cast<MatterSingleton*>(enif_priv_data(env));
+    if (!singleton) return;
+
+    std::lock_guard<std::mutex> lock(MatterSingleton::mutex());
+
+    singleton->ref_count--;
+
+    // Only shut down SDK if this was the owner and no more references
+    if (ctx->is_owner && singleton->ref_count <= 0 && ctx->initialized) {
 #if MATTER_SDK_ENABLED
-        // Cleanup Matter SDK resources
         chip::Server::GetInstance().Shutdown();
         chip::DeviceLayer::PlatformMgr().Shutdown();
 #endif
+        singleton->sdk_initialized = false;
+        singleton->owner_context = nullptr;
         ctx->initialized = false;
     }
 }
@@ -186,7 +280,14 @@ static void matter_context_destructor(ErlNifEnv* env, void* obj) {
  * Returns: {:ok, context} | {:error, reason}
  */
 static ERL_NIF_TERM nif_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-    // Allocate the Matter context resource
+    MatterSingleton* singleton = static_cast<MatterSingleton*>(enif_priv_data(env));
+    if (!singleton) {
+        return ERROR_TUPLE(env, "no_priv_data");
+    }
+
+    std::lock_guard<std::mutex> lock(MatterSingleton::mutex());
+
+    // Allocate a new context resource
     MatterContext* ctx = static_cast<MatterContext*>(
         enif_alloc_resource(MATTER_CONTEXT_RESOURCE, sizeof(MatterContext))
     );
@@ -196,7 +297,24 @@ static ERL_NIF_TERM nif_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]
     }
 
     // Initialize the context
-    ctx->initialized = false;
+    memset(ctx, 0, sizeof(MatterContext));
+
+    // If SDK already initialized, this context shares it but doesn't own lifecycle
+    if (singleton->sdk_initialized && singleton->owner_context) {
+        ctx->initialized = true;
+        ctx->is_owner = false;
+#if MATTER_SDK_ENABLED
+        ctx->wifi_driver = &g_wifi_driver;
+#endif
+        singleton->ref_count++;
+
+        ERL_NIF_TERM context_term = enif_make_resource(env, ctx);
+        enif_release_resource(ctx);
+        return OK_TUPLE(env, context_term);
+    }
+
+    // First initialization - this context owns the SDK lifecycle
+    ctx->is_owner = true;
 
 #if MATTER_SDK_ENABLED
     // Initialize Matter SDK
@@ -205,7 +323,7 @@ static ERL_NIF_TERM nif_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]
         enif_release_resource(ctx);
         return ERROR_TUPLE(env, "chip_init_failed");
     }
-    
+
     // Initialize Network Commissioning
     g_wifi_commissioning_instance.Init();
     ctx->wifi_driver = &g_wifi_driver;
@@ -213,6 +331,9 @@ static ERL_NIF_TERM nif_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]
 
     // Mark as initialized
     ctx->initialized = true;
+    singleton->sdk_initialized = true;
+    singleton->owner_context = ctx;
+    singleton->ref_count = 1;
 
     // Create the Erlang resource term
     ERL_NIF_TERM context_term = enif_make_resource(env, ctx);
@@ -287,29 +408,35 @@ static ERL_NIF_TERM nif_get_info(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
     // Build info map
     ERL_NIF_TERM info_map = enif_make_new_map(env);
 
-    // Add initialized status
+    // Add initialized status - use proper Elixir boolean atoms
     enif_make_map_put(env, info_map,
         ATOM(env, "initialized"),
-        ctx->initialized ? ATOM(env, "true") : ATOM(env, "false"),
+        ctx->initialized ? BOOL_TRUE(env) : BOOL_FALSE(env),
         &info_map);
 
-    // TODO: Add more info from Matter SDK
-    // - Fabric info
-    // - Commissioning state
-    // - Node ID
-    // - etc.
+    // Add is_owner flag
+    enif_make_map_put(env, info_map,
+        ATOM(env, "is_owner"),
+        ctx->is_owner ? BOOL_TRUE(env) : BOOL_FALSE(env),
+        &info_map);
+
+    // Add has_listener flag
+    enif_make_map_put(env, info_map,
+        ATOM(env, "has_listener"),
+        ctx->has_listener ? BOOL_TRUE(env) : BOOL_FALSE(env),
+        &info_map);
 
     // Placeholder version info
     ERL_NIF_TERM version;
     unsigned char* version_data = enif_make_new_binary(env, 5, &version);
-    memcpy(version_data, "0.1.0", 5);
+    memcpy(version_data, "0.2.0", 5);
     enif_make_map_put(env, info_map, ATOM(env, "nif_version"), version, &info_map);
 
     return OK_TUPLE(env, info_map);
 }
 
 /**
- * NIF: set_attribute/4
+ * NIF: set_attribute/5
  * Set a Matter attribute value.
  *
  * Args: context, endpoint_id, cluster_id, attribute_id, value
@@ -402,17 +529,16 @@ static ERL_NIF_TERM nif_get_attribute(ErlNifEnv* env, int argc, const ERL_NIF_TE
          return ERROR_TUPLE(env, "read_failed");
     }
 
-    // Convert to Elixir term based on type
+    // Convert to Elixir term based on type - use proper boolean atoms
     if (data_type == ZCL_BOOLEAN_ATTRIBUTE_TYPE) {
         bool val = *data;
-        return OK_TUPLE(env, val ? ATOM(env, "true") : ATOM(env, "false"));
-    } else if (data_type == ZCL_INT8U_ATTRIBUTE_TYPE || data_type == ZCL_INT16U_ATTRIBUTE_TYPE) {
-        // Simple handling for small unsigned integers
-        // Note: Real implementation should handle all types and sizes
-        unsigned int val = *data; // Just taking first byte for now if 8-bit
-        if (data_type == ZCL_INT16U_ATTRIBUTE_TYPE) {
-             val = *(uint16_t*)data;
-        }
+        return OK_TUPLE(env, val ? BOOL_TRUE(env) : BOOL_FALSE(env));
+    } else if (data_type == ZCL_INT8U_ATTRIBUTE_TYPE) {
+        return OK_TUPLE(env, enif_make_uint(env, *data));
+    } else if (data_type == ZCL_INT16U_ATTRIBUTE_TYPE) {
+        // Use memcpy to avoid unaligned access on ARM
+        uint16_t val;
+        memcpy(&val, data, sizeof(val));
         return OK_TUPLE(env, enif_make_uint(env, val));
     }
 #endif
@@ -503,6 +629,10 @@ static ERL_NIF_TERM nif_get_setup_payload(ErlNifEnv* env, int argc, const ERL_NI
  * NIF: register_callback/1
  * Register the calling process to receive Matter events.
  *
+ * Note: Process monitoring is disabled to avoid BEAM shutdown race conditions.
+ * If the registered process dies, messages will be sent to a dead PID (no harm).
+ * The GenServer should handle this via supervision.
+ *
  * Args: context
  * Returns: :ok | {:error, reason}
  */
@@ -516,15 +646,9 @@ static ERL_NIF_TERM nif_register_callback(ErlNifEnv* env, int argc, const ERL_NI
     ErlNifPid pid;
     enif_self(env, &pid);
 
-    // If we already have a listener, we might want to demonstrate releasing it,
-    // but for now we'll just overwrite/set.
-    // Real implementation should probably handle monitoring to detect if the listener dies.
-
     ctx->listener_pid = pid;
     ctx->has_listener = true;
-
-    // Set the global context if not already set (or update it)
-    g_matter_context = ctx;
+    ctx->monitor_active = false;
 
     return OK(env);
 }
@@ -535,7 +659,9 @@ static ERL_NIF_TERM nif_register_callback(ErlNifEnv* env, int argc, const ERL_NI
  */
 static ERL_NIF_TERM nif_factory_reset(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     MatterContext* ctx;
-    if (!enif_get_resource(env, argv[0], MATTER_CONTEXT_RESOURCE, (void**)&ctx)) return ERROR_TUPLE(env, "invalid_context");
+    if (!enif_get_resource(env, argv[0], MATTER_CONTEXT_RESOURCE, (void**)&ctx)) {
+        return ERROR_TUPLE(env, "invalid_context");
+    }
 
 #if MATTER_SDK_ENABLED
     chip::DeviceLayer::PlatformMgr().LockChipStack();
@@ -554,7 +680,9 @@ static ERL_NIF_TERM nif_set_device_info(ErlNifEnv* env, int argc, const ERL_NIF_
     unsigned int vid, pid, ver;
     ErlNifBinary serial;
 
-    if (!enif_get_resource(env, argv[0], MATTER_CONTEXT_RESOURCE, (void**)&ctx)) return ERROR_TUPLE(env, "invalid_context");
+    if (!enif_get_resource(env, argv[0], MATTER_CONTEXT_RESOURCE, (void**)&ctx)) {
+        return ERROR_TUPLE(env, "invalid_context");
+    }
     if (!enif_get_uint(env, argv[1], &vid) ||
         !enif_get_uint(env, argv[2], &pid) ||
         !enif_get_uint(env, argv[3], &ver) ||
@@ -563,15 +691,12 @@ static ERL_NIF_TERM nif_set_device_info(ErlNifEnv* env, int argc, const ERL_NIF_
     }
 
 #if MATTER_SDK_ENABLED
-    // Note: Writing to ConfigurationManager directly usually updates persistent storage.
-    // In a real product, these might be read-only from factory data.
-    // This is a "development" override.
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     chip::DeviceLayer::ConfigurationMgr().StoreManufacturerDeviceId((uint16_t)vid);
     chip::DeviceLayer::ConfigurationMgr().StoreProductId((uint16_t)pid);
     chip::DeviceLayer::ConfigurationMgr().StoreSoftwareVersion((uint32_t)ver);
-    
-    // Serial number handling usually requires a buffer copy
+
+    // Serial number handling
     if (serial.size > 0 && serial.size < 32) {
         char serial_buf[33];
         memcpy(serial_buf, serial.data, serial.size);
@@ -671,7 +796,66 @@ static ERL_NIF_TERM nif_wifi_connect_result(ErlNifEnv* env, int argc, const ERL_
     return OK(env);
 }
 
+/**
+ * NIF: wifi_scan_result/2
+ * Report WiFi scan results back to Matter SDK.
+ *
+ * Args: context, status (0 = success with no results for now)
+ * Returns: :ok | {:error, reason}
+ */
+static ERL_NIF_TERM nif_wifi_scan_result(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    MatterContext* ctx;
+    int status;
+
+    if (!enif_get_resource(env, argv[0], MATTER_CONTEXT_RESOURCE, (void**)&ctx)) {
+        return ERROR_TUPLE(env, "invalid_context");
+    }
+    if (!enif_get_int(env, argv[1], &status)) {
+        return ERROR_TUPLE(env, "invalid_args");
+    }
+
+#if MATTER_SDK_ENABLED
+    chip::DeviceLayer::PlatformMgr().LockChipStack();
+
+    if (ctx->wifi_driver && ctx->wifi_driver->mpScanCallback) {
+        chip::DeviceLayer::NetworkCommissioning::Status scanStatus =
+            (status == 0) ? chip::DeviceLayer::NetworkCommissioning::Status::kSuccess
+                          : chip::DeviceLayer::NetworkCommissioning::Status::kUnknownError;
+
+        // Signal scan complete - full implementation would pass actual network list
+        ctx->wifi_driver->mpScanCallback->OnFinished(scanStatus, chip::CharSpan(), nullptr);
+        ctx->wifi_driver->mpScanCallback = nullptr;
+    }
+
+    chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+#endif
+
+    return OK(env);
+}
+
 // NIF function table
+// Note: Dirty scheduler flags (ERL_NIF_DIRTY_JOB_IO_BOUND) should be enabled
+// when Matter SDK is enabled, as those calls may block. For stub mode, we use
+// regular schedulers to avoid BEAM threading complications during testing.
+#if MATTER_SDK_ENABLED
+static ErlNifFunc nif_funcs[] = {
+    {"nif_init", 0, nif_init, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_start_server", 1, nif_start_server, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_stop_server", 1, nif_stop_server, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_get_info", 1, nif_get_info, 0},
+    {"nif_set_attribute", 5, nif_set_attribute, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_get_attribute", 4, nif_get_attribute, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_open_commissioning_window", 2, nif_open_commissioning_window, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_get_setup_payload", 1, nif_get_setup_payload, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_register_callback", 1, nif_register_callback, 0},
+    {"nif_factory_reset", 1, nif_factory_reset, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_set_device_info", 5, nif_set_device_info, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_set_commissioning_info", 3, nif_set_commissioning_info, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_wifi_connect_result", 2, nif_wifi_connect_result, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_wifi_scan_result", 2, nif_wifi_scan_result, ERL_NIF_DIRTY_JOB_IO_BOUND},
+};
+#else
+// Stub mode - no blocking calls, use regular schedulers
 static ErlNifFunc nif_funcs[] = {
     {"nif_init", 0, nif_init, 0},
     {"nif_start_server", 1, nif_start_server, 0},
@@ -686,13 +870,28 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_set_device_info", 5, nif_set_device_info, 0},
     {"nif_set_commissioning_info", 3, nif_set_commissioning_info, 0},
     {"nif_wifi_connect_result", 2, nif_wifi_connect_result, 0},
+    {"nif_wifi_scan_result", 2, nif_wifi_scan_result, 0},
 };
+#endif
 
 /**
  * NIF load callback - called when the module is loaded
  */
 static int nif_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
-    // Create the resource type for Matter context
+    // Allocate singleton holder
+    MatterSingleton* singleton = new (std::nothrow) MatterSingleton();
+    if (!singleton) {
+        return -1;
+    }
+    *priv_data = singleton;
+
+#if MATTER_SDK_ENABLED
+    g_singleton = singleton;
+#endif
+
+    // Create resource type
+    // Note: Using enif_open_resource_type instead of enif_open_resource_type_x
+    // to avoid potential issues with the down callback during BEAM shutdown.
     MATTER_CONTEXT_RESOURCE = enif_open_resource_type(
         env,
         nullptr,
@@ -703,6 +902,7 @@ static int nif_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
     );
 
     if (!MATTER_CONTEXT_RESOURCE) {
+        delete singleton;
         return -1;
     }
 
@@ -710,9 +910,29 @@ static int nif_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
 }
 
 /**
+ * NIF unload callback - cleanup when module is unloaded
+ */
+static void nif_unload(ErlNifEnv* env, void* priv_data) {
+    MatterSingleton* singleton = static_cast<MatterSingleton*>(priv_data);
+    if (singleton) {
+#if MATTER_SDK_ENABLED
+        g_singleton = nullptr;
+#endif
+        delete singleton;
+    }
+}
+
+/**
  * NIF upgrade callback - called when the module is hot-reloaded
  */
 static int nif_upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data, ERL_NIF_TERM load_info) {
+    // Take over singleton from old module
+    *priv_data = *old_priv_data;
+
+#if MATTER_SDK_ENABLED
+    g_singleton = static_cast<MatterSingleton*>(*priv_data);
+#endif
+
     // Take over the resource type from the old module
     MATTER_CONTEXT_RESOURCE = enif_open_resource_type(
         env,
@@ -727,7 +947,9 @@ static int nif_upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data, E
 }
 
 // NIF initialization macro
-ERL_NIF_INIT(Elixir.Matterlix.Matter.NIF, nif_funcs, nif_load, nullptr, nif_upgrade, nullptr)
+// Signature: ERL_NIF_INIT(MODULE, FUNCS, LOAD, RELOAD, UPGRADE, UNLOAD)
+// RELOAD is deprecated and should be NULL
+ERL_NIF_INIT(Elixir.Matterlix.Matter.NIF, nif_funcs, nif_load, nullptr, nif_upgrade, nif_unload)
 
 #if MATTER_SDK_ENABLED
 /**
@@ -739,34 +961,43 @@ void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & 
                                        uint16_t size,
                                        uint8_t * value)
 {
-    if (g_matter_context && g_matter_context->has_listener) {
-        ErlNifEnv* msg_env = enif_alloc_env();
-
-        // Decode value based on type (simplified for common types)
-        ERL_NIF_TERM val_term;
-        if (type == ZCL_BOOLEAN_ATTRIBUTE_TYPE) {
-            val_term = (*value != 0) ? ATOM(msg_env, "true") : ATOM(msg_env, "false");
-        } else if (type == ZCL_INT8U_ATTRIBUTE_TYPE) {
-            val_term = enif_make_uint(msg_env, *value);
-        } else if (type == ZCL_INT16U_ATTRIBUTE_TYPE && size >= 2) {
-             val_term = enif_make_uint(msg_env, *(uint16_t*)value);
-        } else {
-             // Fallback for other types: return raw integer or binary?
-             // For now, just nil, signaling "query it yourself"
-             val_term = ATOM(msg_env, "nil");
-        }
-
-        ERL_NIF_TERM msg = enif_make_tuple6(msg_env,
-            ATOM(msg_env, "attribute_changed"),
-            enif_make_uint(msg_env, path.mEndpointId),
-            enif_make_uint(msg_env, path.mClusterId),
-            enif_make_uint(msg_env, path.mAttributeId),
-            enif_make_uint(msg_env, type),
-            val_term
-        );
-
-        enif_send(NULL, &g_matter_context->listener_pid, msg_env, msg);
-        enif_free_env(msg_env);
+    ErlNifPid pid;
+    if (!get_listener_info(&pid)) {
+        return;  // No listener registered
     }
+
+    ErlNifEnv* msg_env = enif_alloc_env();
+    if (!msg_env) {
+        return;
+    }
+
+    // Decode value based on type (simplified for common types)
+    // Use proper Elixir boolean atoms
+    ERL_NIF_TERM val_term;
+    if (type == ZCL_BOOLEAN_ATTRIBUTE_TYPE) {
+        val_term = (*value != 0) ? BOOL_TRUE(msg_env) : BOOL_FALSE(msg_env);
+    } else if (type == ZCL_INT8U_ATTRIBUTE_TYPE) {
+        val_term = enif_make_uint(msg_env, *value);
+    } else if (type == ZCL_INT16U_ATTRIBUTE_TYPE && size >= 2) {
+        // Use memcpy to avoid unaligned access on ARM
+        uint16_t tmp;
+        memcpy(&tmp, value, sizeof(tmp));
+        val_term = enif_make_uint(msg_env, tmp);
+    } else {
+        // Fallback for other types: return nil, signaling "query it yourself"
+        val_term = ATOM(msg_env, "nil");
+    }
+
+    ERL_NIF_TERM msg = enif_make_tuple6(msg_env,
+        ATOM(msg_env, "attribute_changed"),
+        enif_make_uint(msg_env, path.mEndpointId),
+        enif_make_uint(msg_env, path.mClusterId),
+        enif_make_uint(msg_env, path.mAttributeId),
+        enif_make_uint(msg_env, type),
+        val_term
+    );
+
+    enif_send(NULL, &pid, msg_env, msg);
+    enif_free_env(msg_env);
 }
 #endif

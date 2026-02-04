@@ -95,6 +95,9 @@ defmodule Matterlix.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      # Build tools
+      {:elixir_make, "~> 0.8", runtime: false},
+
       # Documentation
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
 

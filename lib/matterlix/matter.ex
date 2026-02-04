@@ -288,6 +288,43 @@ defmodule Matterlix.Matter do
     {:noreply, state}
   end
 
+  # Handle attribute_changed from Matter SDK callback
+  @impl true
+  def handle_info({:attribute_changed, endpoint_id, cluster_id, attribute_id, type, value}, state) do
+    Logger.debug(
+      "Matter: Attribute changed - endpoint=#{endpoint_id}, " <>
+        "cluster=0x#{Integer.to_string(cluster_id, 16)}, " <>
+        "attr=0x#{Integer.to_string(attribute_id, 16)}, type=#{type}, value=#{inspect(value)}"
+    )
+
+    {:noreply, state}
+  end
+
+  # Handle scan_networks request from Matter SDK
+  @impl true
+  def handle_info({:scan_networks, _filter}, state) do
+    Logger.info("Matter: Network scan requested")
+
+    if Code.ensure_loaded?(VintageNetWiFi) do
+      case VintageNetWiFi.scan(@wifi_interface) do
+        :ok ->
+          Logger.debug("Matter: WiFi scan initiated")
+          # For now, immediately report scan complete with no results
+          # A full implementation would wait for scan results and parse them
+          NIF.nif_wifi_scan_result(state.context, 0)
+
+        {:error, reason} ->
+          Logger.error("Matter: Failed to initiate WiFi scan: #{inspect(reason)}")
+          NIF.nif_wifi_scan_result(state.context, 1)
+      end
+    else
+      Logger.info("Matter: VintageNet not available (host mode), simulating scan success")
+      NIF.nif_wifi_scan_result(state.context, 0)
+    end
+
+    {:noreply, state}
+  end
+
   # Handle connect_network from Matter SDK - trigger VintageNet WiFi connection
   @impl true
   def handle_info({:connect_network, ssid, credentials}, state) do
@@ -295,6 +332,9 @@ defmodule Matterlix.Matter do
     psk_str = to_string(credentials)
 
     Logger.info("Matter: Connecting to WiFi network: #{ssid_str}")
+
+    # Cancel any existing timer to prevent leaks
+    state = cancel_pending_wifi_timer(state)
 
     if Code.ensure_loaded?(VintageNetWiFi) do
       # Configure WiFi with VintageNet
@@ -457,5 +497,14 @@ defmodule Matterlix.Matter do
     end
 
     :ok
+  end
+
+  # Private helpers
+
+  defp cancel_pending_wifi_timer(%{pending_wifi_connect: nil} = state), do: state
+
+  defp cancel_pending_wifi_timer(%{pending_wifi_connect: timer_ref} = state) do
+    Process.cancel_timer(timer_ref)
+    %{state | pending_wifi_connect: nil}
   end
 end

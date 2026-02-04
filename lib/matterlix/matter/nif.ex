@@ -155,6 +155,19 @@ defmodule Matterlix.Matter.NIF do
   end
 
   @doc """
+  Report the result of a WiFi scan (Network Commissioning).
+  Called by Elixir in response to a {:scan_networks, ...} message.
+
+  ## Parameters
+  - `context` - The Matter context
+  - `status` - 0 for success, non-zero for failure
+  """
+  @spec nif_wifi_scan_result(reference(), integer()) :: :ok | {:error, atom()}
+  def nif_wifi_scan_result(_context, _status) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  @doc """
   Set the commissioning info (setup PIN and discriminator).
   Must be called before starting the server for values to take effect.
 

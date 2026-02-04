@@ -1,9 +1,45 @@
 # Matter SDK Include Paths
-# Auto-generated from Matter SDK build
+# Supports both host and cross-compilation builds
 # To regenerate: Run Matter SDK build and extract includes from compile_commands.json
 
 MATTER_SDK_ROOT = $(shell pwd)/deps/connectedhomeip
-MATTER_BUILD_DIR = $(MATTER_SDK_ROOT)/out/darwin-arm64-light
+
+# Detect target platform dynamically
+ifeq ($(CROSSCOMPILE),1)
+    # Cross-compilation: determine target from Nerves environment
+    ifeq ($(findstring aarch64,$(TARGET_ARCH)),aarch64)
+        MATTER_TARGET = linux-arm64-light
+    else ifeq ($(findstring arm,$(TARGET_ARCH)),arm)
+        MATTER_TARGET = linux-arm-light
+    else
+        MATTER_TARGET = linux-x64-light
+    endif
+else
+    # Host compilation: detect from uname
+    UNAME_S := $(shell uname -s)
+    UNAME_M := $(shell uname -m)
+
+    ifeq ($(UNAME_S),Darwin)
+        ifeq ($(UNAME_M),arm64)
+            MATTER_TARGET = darwin-arm64-light
+        else
+            MATTER_TARGET = darwin-x64-light
+        endif
+    else ifeq ($(UNAME_S),Linux)
+        ifeq ($(UNAME_M),aarch64)
+            MATTER_TARGET = linux-arm64-light
+        else ifeq ($(UNAME_M),armv7l)
+            MATTER_TARGET = linux-arm-light
+        else
+            MATTER_TARGET = linux-x64-light
+        endif
+    else
+        # Fallback
+        MATTER_TARGET = linux-x64-light
+    endif
+endif
+
+MATTER_BUILD_DIR = $(MATTER_SDK_ROOT)/out/$(MATTER_TARGET)
 
 # Core Matter SDK includes
 MATTER_INCLUDES = \
@@ -56,7 +92,16 @@ MATTER_INCLUDES += \
 # Matter SDK library
 MATTER_LIBS = -L$(MATTER_BUILD_DIR)/lib -lCHIP
 
-# Additional libraries needed on Darwin
+# Platform-specific libraries
 ifeq ($(shell uname -s),Darwin)
-    MATTER_LIBS += -framework CoreFoundation -framework CoreBluetooth -framework IOKit -framework Security
+    ifeq ($(CROSSCOMPILE),1)
+        # Cross-compiling from Darwin to Linux
+        MATTER_LIBS += -lpthread -ldl -lrt
+    else
+        # Native Darwin build
+        MATTER_LIBS += -framework CoreFoundation -framework CoreBluetooth -framework IOKit -framework Security
+    endif
+else
+    # Linux host or target
+    MATTER_LIBS += -lpthread -ldl -lrt
 endif
