@@ -117,7 +117,7 @@ source scripts/bootstrap.sh -p linux
 python3 scripts/build/build_examples.py --target darwin-arm64-light build
 
 # Linux x64:
-# python3 scripts/build/build_examples.py --target linux-x64-light build
+python3 scripts/build/build_examples.py --target linux-x64-light build
 ```
 
 ### 4. Build with Matter SDK
