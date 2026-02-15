@@ -49,6 +49,7 @@ This project bridges the Matter C++ SDK with Elixir/Nerves using Native Implemen
 
 - **NIF-based integration** - Direct binding to Matter SDK for performance
 - **Elixir GenServer API** - Idiomatic Elixir interface for Matter operations
+- **Configurable device profiles** - Build for lights, sensors, locks, thermostats, and more
 - **Cross-compilation ready** - Build for Raspberry Pi targets with Nerves
 - **Stub mode** - Develop and test without Matter SDK dependency
 - **Commissioning Support** - QR Code generation, Commissioning Window management
@@ -108,29 +109,59 @@ cd deps/connectedhomeip
 
 # Initialize submodules (Linux platform only, saves space)
 python3 scripts/checkout_submodules.py --shallow --platform linux
-
-# Bootstrap build environment
-source scripts/bootstrap.sh -p linux
-
-# Build for your platform
-# macOS ARM64:
-python3 scripts/build/build_examples.py --target darwin-arm64-light build
-
-# Linux x64:
-python3 scripts/build/build_examples.py --target linux-x64-light build
 ```
 
-### 4. Build with Matter SDK
+### 4. Build Matter SDK for a Device Profile
+
+The Matter SDK is built inside Docker for a specific device profile. Each profile determines which Matter clusters (OnOff, Temperature, DoorLock, etc.) are available on the device.
 
 ```bash
-cd /path/to/matterlix
+# List available profiles
+mix matterlix.build_sdk --list
+
+# Build for the default profile (light)
+mix matterlix.build_sdk
+
+# Build for a specific profile
+mix matterlix.build_sdk --profile contact_sensor
+```
+
+This builds the Matter SDK in an arm64 Docker container and auto-generates `matter_sdk_includes.mk` with the correct object files and libraries for the selected profile.
+
+> Requires Docker and Apple Silicon Mac (native arm64 build). The first build takes ~20-30 minutes.
+
+### 5. Compile with Matter SDK
+
+```bash
 MATTER_SDK_ENABLED=1 mix compile
 ```
+
+## Device Profiles
+
+Each profile maps to a Matter SDK example app with pre-configured clusters:
+
+| Profile | Clusters | Use Case |
+|---------|----------|----------|
+| `light` (default) | OnOff, LevelControl, ColorControl | Dimmable color light |
+| `contact_sensor` | BooleanState | Door/window sensor |
+| `lock` | DoorLock | Smart lock |
+| `thermostat` | Thermostat | HVAC control |
+| `air_quality_sensor` | AirQuality, Temperature, Humidity | Environmental sensing |
+| `all_clusters` | All standard clusters | Development/testing |
+
+Set the default profile in your config:
+
+```elixir
+# config/config.exs
+config :matterlix, device_profile: :light
+```
+
+To switch profiles, change the config and re-run `mix matterlix.build_sdk`.
 
 ## Building for Raspberry Pi
 
 ```bash
-export MIX_TARGET=rpi4  # or rpi3
+export MIX_TARGET=rpi4  # or rpi3, rpi0_2
 mix deps.get
 mix firmware
 mix burn  # Insert SD card
@@ -241,13 +272,27 @@ See `example/README.md` for detailed documentation.
 
 ## Configuration
 
+### Application Config
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `device_profile` | Matter device type (`:light`, `:lock`, `:thermostat`, etc.) | `:light` |
+| `debug` | Enable debug logging and verbose crash messages | `false` |
+
+```elixir
+config :matterlix,
+  device_profile: :light,
+  debug: false
+```
+
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MATTER_SDK_ENABLED` | Enable Matter SDK integration | `0` |
+| `MATTER_DEBUG` | Enable debug instrumentation in NIF | `0` |
 | `ASAN` | Enable AddressSanitizer for memory safety | `0` |
-| `MIX_TARGET` | Nerves target (rpi3, rpi4, host) | `host` |
+| `MIX_TARGET` | Nerves target (rpi3, rpi4, rpi0_2, host) | `host` |
 | `CROSSCOMPILE` | Enable cross-compilation | auto |
 
 ## Current Status
@@ -261,7 +306,9 @@ See `example/README.md` for detailed documentation.
 - [x] Attribute Management (Get/Set/Callbacks)
 - [x] Network Commissioning (WiFi)
 - [x] Security Testing (ASan + CI)
-- [ ] Cross-compilation for ARM (Verified on HW)
+- [x] Configurable device profiles (light, sensor, lock, thermostat, etc.)
+- [x] Docker-based SDK build with `mix matterlix.build_sdk`
+- [x] Cross-compilation for ARM (Verified on RPi Zero 2 W)
 
 ## Resources
 

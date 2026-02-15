@@ -74,10 +74,20 @@ defmodule Matterlix.MixProject do
 
   defp make_env(target) do
     # For target builds, use Nerves cross-compilation environment
-    %{
+    profile = Application.get_env(:matterlix, :device_profile, :light)
+
+    env = %{
       "TARGET" => to_string(target),
-      "CROSSCOMPILE" => "1"
+      "CROSSCOMPILE" => "1",
+      "MATTER_SDK_ENABLED" => "1",
+      "MATTER_PROFILE" => to_string(profile)
     }
+
+    if Application.get_env(:matterlix, :debug, false) do
+      Map.put(env, "MATTER_DEBUG", "1")
+    else
+      env
+    end
   end
 
   # Run "mix help compile.app" to learn about applications.

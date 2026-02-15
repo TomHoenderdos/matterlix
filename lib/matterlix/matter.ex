@@ -227,6 +227,19 @@ defmodule Matterlix.Matter do
     GenServer.call(server, {:set_commissioning_info, setup_pin, discriminator})
   end
 
+  @spec set_attribute_change_callback_fn(GenServer.server(), (endpoint_id ::
+                                                                non_neg_integer(),
+                                                              cluster_id :: non_neg_integer(),
+                                                              attribute_id ::
+                                                                non_neg_integer(),
+                                                              type :: atom(),
+                                                              value :: term() ->
+                                                                :ok)) ::
+          :ok | {:error, term()}
+  def set_attribute_change_callback_fn(server, callback_fn) do
+    GenServer.call(server, {:on_attribute_change_callback_function, callback_fn})
+  end
+
   # Server Callbacks
 
   @impl true
@@ -296,6 +309,16 @@ defmodule Matterlix.Matter do
         "cluster=0x#{Integer.to_string(cluster_id, 16)}, " <>
         "attr=0x#{Integer.to_string(attribute_id, 16)}, type=#{type}, value=#{inspect(value)}"
     )
+
+    if Map.has_key?(state, :on_attribute_change_callback_function) do
+      state.on_attribute_change_callback_function().(
+        endpoint_id,
+        cluster_id,
+        attribute_id,
+        type,
+        value
+      )
+    end
 
     {:noreply, state}
   end
@@ -491,6 +514,15 @@ defmodule Matterlix.Matter do
   end
 
   @impl true
+  def handle_call({:on_attribute_change_callback_function, callback_fn}, _from, state) do
+    if valid_callback_function?(callback_fn) do
+      {:reply, :ok, Map.put(state, :on_attribute_change_callback_function, callback_fn)}
+    else
+      {:reply, {:error, :invalid_callback_function}, state}
+    end
+  end
+
+  @impl true
   def terminate(_reason, state) do
     if state.started do
       NIF.nif_stop_server(state.context)
@@ -500,6 +532,10 @@ defmodule Matterlix.Matter do
   end
 
   # Private helpers
+
+  @valid_callback_function_arity 5
+  defp valid_callback_function?(callback_fn),
+    do: is_function(callback_fn, @valid_callback_function_arity)
 
   defp cancel_pending_wifi_timer(%{pending_wifi_connect: nil} = state), do: state
 
