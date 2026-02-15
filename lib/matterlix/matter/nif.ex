@@ -8,19 +8,22 @@ defmodule Matterlix.Matter.NIF do
 
   @on_load :load_nif
 
+  require Logger
+
   @doc false
   def load_nif do
     nif_path = :filename.join(:code.priv_dir(:matterlix), ~c"matter_nif")
 
     case :erlang.load_nif(nif_path, 0) do
       :ok ->
+        Logger.info("Matter NIF loaded successfully from #{nif_path}")
         :ok
 
       {:error, {:reload, _}} ->
         :ok
 
       {:error, reason} ->
-        IO.warn("Failed to load Matter NIF: #{inspect(reason)}")
+        Logger.error("Failed to load Matter NIF: #{inspect(reason)}")
         :ok
     end
   end

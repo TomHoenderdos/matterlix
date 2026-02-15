@@ -2,7 +2,7 @@ defmodule Matterlix.MixProject do
   use Mix.Project
 
   @app :matterlix
-  @version "0.2.0"
+  @version "0.3.0"
 
   def project do
     [
@@ -45,7 +45,11 @@ defmodule Matterlix.MixProject do
       licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => "https://github.com/tomHoenderdos/matterlix"
-      }
+      },
+      files: ~w(
+        lib c_src Makefile matter_sdk_includes.mk
+        mix.exs README.md CHANGELOG.md LICENSE
+      )
     ]
   end
 

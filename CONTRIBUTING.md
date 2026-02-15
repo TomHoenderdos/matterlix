@@ -12,7 +12,7 @@ This project follows the [Contributor Covenant Code of Conduct](https://www.cont
 
 - Elixir 1.18+ and Erlang/OTP 27+
 - C++ compiler with C++17 support
-- For full Matter SDK integration: CMake, Ninja, Python 3.8+
+- For Matter SDK builds: Docker (arm64 native or emulated)
 
 ### Development Setup
 

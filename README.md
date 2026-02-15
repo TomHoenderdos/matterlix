@@ -5,115 +5,118 @@
 [![Hex Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/matterlix)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-A Nerves-based Elixir application that integrates the [Matter](https://csa-iot.org/all-solutions/matter/) (formerly Project CHIP) smart home protocol, enabling Raspberry Pi devices to participate in Matter networks.
+Elixir NIF bindings for the [Matter](https://csa-iot.org/all-solutions/matter/) (CHIP) smart home protocol. Build Matter-compatible devices on embedded Linux with Nerves.
 
 **Matter + Elixir = Matterlix**
 
 ## Overview
 
-This project bridges the Matter C++ SDK with Elixir/Nerves using Native Implemented Functions (NIFs), allowing you to build Matter-compatible smart home devices running on embedded Linux.
+Matterlix is a reusable Elixir library that bridges the Matter C++ SDK with Elixir using NIFs. Your firmware project depends on matterlix and implements a Handler behaviour to react to Matter events.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                   Elixir Application                │
+│                   Your Firmware                     │
 │  ┌───────────────┐    ┌──────────────────────────┐  │
-│  │   Matterlix   │───▶│ Matterlix.Matter         │  │
-│  │  (Your App)   │    │ (GenServer API)          │  │
+│  │   Your App    │───▶│ Matterlix.Handler        │  │
+│  │  (Nerves)     │    │ (Your callbacks)         │  │
 │  └───────────────┘    └──────────────────────────┘  │
 │                              │                      │
 │                              ▼                      │
-│                       ┌──────────────────────────┐  │
-│                       │ Matterlix.Matter.NIF     │  │
-│                       │ (Elixir NIF Bindings)    │  │
-│                       └──────────────────────────┘  │
-└───────────────────────────────┬─────────────────────┘
-                                │ NIF calls
-                                ▼
-┌─────────────────────────────────────────────────────┐
-│                  C++ NIF Layer                      │
-│              (c_src/matter_nif.cpp)                 │
-└───────────────────────────────┬─────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────┐
-│                   Matter SDK                        │
-│              (libCHIP.a / connectedhomeip)          │
-│  ┌─────────────┐ ┌─────────────┐ ┌──────────────┐   │
-│  │ DeviceLayer │ │   Server    │ │  Data Model  │   │
-│  │ PlatformMgr │ │  Instance   │ │  (Clusters)  │   │
-│  └─────────────┘ └─────────────┘ └──────────────┘   │
+│  ┌──────────────────────────────────────────────┐   │
+│  │             Matterlix (library)              │   │
+│  │  Matterlix.Matter (GenServer)                │   │
+│  │  Matterlix.Matter.NIF (NIF bindings)         │   │
+│  │  c_src/matter_nif.cpp (C++ NIF)              │   │
+│  └──────────────────────────────────────────────┘   │
+│                              │                      │
+│                              ▼                      │
+│  ┌──────────────────────────────────────────────┐   │
+│  │            Matter SDK (libCHIP.a)            │   │
+│  │  DeviceLayer │ Server │ Data Model (Clusters)│   │
+│  └──────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────┘
 ```
 
 ## Features
 
-- **NIF-based integration** - Direct binding to Matter SDK for performance
-- **Elixir GenServer API** - Idiomatic Elixir interface for Matter operations
-- **Configurable device profiles** - Build for lights, sensors, locks, thermostats, and more
-- **Cross-compilation ready** - Build for Raspberry Pi targets with Nerves
+- **Reusable library** - Add to any Nerves firmware project as a dependency
+- **Handler behaviour** - Implement `Matterlix.Handler` to react to Matter events
+- **Device profiles** - Build for lights, sensors, locks, thermostats, and more
+- **Convenience API** - `Matterlix.update_attribute/4` for pushing sensor data
 - **Stub mode** - Develop and test without Matter SDK dependency
-- **Commissioning Support** - QR Code generation, Commissioning Window management
-- **Network Commissioning** - WiFi credential passing to Elixir (for VintageNet integration)
-- **Attribute Callbacks** - Real-time Elixir events when attributes change
-- **Device Management** - Factory Reset, Device Info configuration
+- **Commissioning** - QR Code generation, BLE/WiFi commissioning
+- **Network Commissioning** - WiFi credential passing to Elixir (VintageNet integration)
+- **Cross-compilation** - Docker-based arm64 SDK build for Raspberry Pi
 
 ## Prerequisites
 
-- Elixir 1.14+ and Erlang/OTP 25+
+- Elixir 1.18+ and Erlang/OTP 27+
 - C++ compiler with C++17 support
-- For Matter SDK integration:
-  - CMake 3.16+
-  - Ninja build system
-  - Python 3.8+
-
-### macOS
-
-```bash
-brew install cmake ninja
-```
-
-### Linux (Debian/Ubuntu)
-
-```bash
-sudo apt-get install cmake ninja-build python3 python3-venv
-```
+- For Matter SDK builds: Docker (arm64 native or emulated)
 
 ## Quick Start
 
-### 1. Clone and Setup
+### 1. Add Dependency
 
-```bash
-git clone <repository-url> matterlix
-cd matterlix
-mix deps.get
+```elixir
+# In your firmware project's mix.exs
+def deps do
+  [{:matterlix, "~> 0.3"}]
+end
 ```
 
-### 2. Build (Stub Mode)
+### 2. Implement a Handler
 
-Without the Matter SDK, you can build and test the NIF skeleton:
+```elixir
+defmodule MyApp.MatterHandler do
+  @behaviour Matterlix.Handler
 
-```bash
-mix compile
-mix run -e '{:ok, ctx} = Matterlix.Matter.NIF.nif_init(); IO.inspect(Matterlix.Matter.NIF.nif_get_info(ctx))'
+  @impl true
+  def handle_attribute_change(1, 0x0006, 0x0000, _type, value) do
+    # React to On/Off toggle from a Matter controller
+    MyApp.LED.set(value)
+    :ok
+  end
+
+  def handle_attribute_change(_ep, _cluster, _attr, _type, _value), do: :ok
+end
 ```
 
-### 3. Setup Matter SDK (Optional)
+### 3. Configure
 
-To enable full Matter functionality:
+```elixir
+# config/config.exs
+config :matterlix,
+  handler: MyApp.MatterHandler,
+  device_profile: :light,
+  setup_pin: 20202021,
+  discriminator: 3840
+```
+
+### 4. Push Data to Matter
+
+```elixir
+# Push a sensor reading — controllers get notified automatically
+Matterlix.update_attribute(1, 0x0402, 0x0000, 2350)
+
+# Toggle a light
+Matterlix.update_attribute(1, 0x0006, 0x0000, true)
+```
+
+## Building the Matter SDK
+
+The library compiles in **stub mode** by default (no Matter SDK needed). For actual Matter functionality, build the SDK:
+
+### 1. Clone Matter SDK
 
 ```bash
-# Clone Matter SDK
 mkdir -p deps
 git clone --depth 1 https://github.com/project-chip/connectedhomeip.git deps/connectedhomeip
 cd deps/connectedhomeip
-
-# Initialize submodules (Linux platform only, saves space)
 python3 scripts/checkout_submodules.py --shallow --platform linux
 ```
 
-### 4. Build Matter SDK for a Device Profile
-
-The Matter SDK is built inside Docker for a specific device profile. Each profile determines which Matter clusters (OnOff, Temperature, DoorLock, etc.) are available on the device.
+### 2. Build for a Device Profile
 
 ```bash
 # List available profiles
@@ -126,11 +129,11 @@ mix matterlix.build_sdk
 mix matterlix.build_sdk --profile contact_sensor
 ```
 
-This builds the Matter SDK in an arm64 Docker container and auto-generates `matter_sdk_includes.mk` with the correct object files and libraries for the selected profile.
+This builds the Matter SDK in an arm64 Docker container and generates `matter_sdk_includes.mk` with the correct object files and libraries.
 
-> Requires Docker and Apple Silicon Mac (native arm64 build). The first build takes ~20-30 minutes.
+> First build takes ~20-30 minutes.
 
-### 5. Compile with Matter SDK
+### 3. Compile with Matter SDK
 
 ```bash
 MATTER_SDK_ENABLED=1 mix compile
@@ -149,69 +152,28 @@ Each profile maps to a Matter SDK example app with pre-configured clusters:
 | `air_quality_sensor` | AirQuality, Temperature, Humidity | Environmental sensing |
 | `all_clusters` | All standard clusters | Development/testing |
 
-Set the default profile in your config:
+## System Requirements for Commissioning
 
-```elixir
-# config/config.exs
-config :matterlix, device_profile: :light
-```
+Matter BLE commissioning requires BlueZ and D-Bus on Linux. Stock Nerves systems do **not** include Bluetooth support. You need a custom Nerves system with:
 
-To switch profiles, change the config and re-run `mix matterlix.build_sdk`.
+- **Kernel**: `CONFIG_BT`, `CONFIG_BT_HCIUART`, `CONFIG_BT_HCIUART_BCM`
+- **Buildroot**: `BR2_PACKAGE_DBUS`, `BR2_PACKAGE_BLUEZ5_UTILS`
+- **Runtime**: `dbus-daemon` + `bluetoothd`
 
-## Building for Raspberry Pi
+See the `example/` directory for a working firmware project.
 
-```bash
-export MIX_TARGET=rpi4  # or rpi3, rpi0_2
-mix deps.get
-mix firmware
-mix burn  # Insert SD card
-```
-
-## Testing & Security
-
-### AddressSanitizer (ASan)
-
-To test for memory safety issues in the C++ NIF:
+## Testing
 
 ```bash
+# Run tests (stub mode, no SDK needed)
+mix test
+
+# With AddressSanitizer (memory safety)
 ASAN=1 mix test
-```
 
-### Docker CI
-
-To run the full test suite with ASan in a Linux environment (bypassing macOS SIP issues):
-
-```bash
+# CI suite in Docker
 docker build -f Dockerfile.ci -t matterlix-ci .
 docker run --rm matterlix-ci
-```
-
-## API Examples
-
-### Initialize & Commission
-
-```elixir
-{:ok, ctx} = Matterlix.Matter.NIF.nif_init()
-:ok = Matterlix.Matter.NIF.nif_register_callback(ctx)
-
-# Get pairing info
-{:ok, payload} = Matterlix.Matter.NIF.nif_get_setup_payload(ctx)
-IO.puts "QR Code: #{payload.qr_code}"
-
-# Allow pairing for 5 minutes
-:ok = Matterlix.Matter.NIF.nif_open_commissioning_window(ctx, 300)
-
-:ok = Matterlix.Matter.NIF.nif_start_server(ctx)
-```
-
-### Attributes
-
-```elixir
-# Read an attribute (endpoint 1, On/Off cluster, OnOff attribute)
-{:ok, value} = Matterlix.Matter.NIF.nif_get_attribute(ctx, 1, 0x0006, 0x0000)
-
-# Set an attribute
-:ok = Matterlix.Matter.NIF.nif_set_attribute(ctx, 1, 0x0006, 0x0000, true)
 ```
 
 ## Complete Example
@@ -230,60 +192,18 @@ example/
     └── target.exs            # Raspberry Pi GPIO & commissioning config
 ```
 
-### Run on Host (No Hardware Required)
-
-```bash
-cd example
-mix deps.get
-iex -S mix
-
-# Simulate button presses
-iex> Example.PairingButton.simulate_short_press()  # Toggle light
-iex> Example.PairingButton.simulate_long_press()   # Enter pairing mode
-
-# Check LED status
-iex> Example.StatusLed.set_mode(:pairing)  # Blink pattern
-iex> Example.StatusLed.set_mode(:paired)   # Solid on
-```
-
-### Deploy to Raspberry Pi
-
-```bash
-cd example
-export MIX_TARGET=rpi4
-mix deps.get
-mix firmware
-mix burn
-```
-
-**Wiring (BCM pin numbers):**
-- GPIO17 → Button (to GND, uses internal pull-up)
-- GPIO27 → LED anode (with 330Ω resistor to GND)
-
-### What It Demonstrates
-
-- **GenServer integration** - Clean separation between Matter and device logic
-- **Event handling** - React to attribute changes from Matter controllers
-- **Hardware abstraction** - Same code runs on host (simulated) and Raspberry Pi
-- **Commissioning flow** - Pairing button, status LED feedback, QR codes
-- **Graceful degradation** - Falls back to simulation when GPIO unavailable
-
 See `example/README.md` for detailed documentation.
 
 ## Configuration
 
-### Application Config
-
 | Key | Description | Default |
 |-----|-------------|---------|
-| `device_profile` | Matter device type (`:light`, `:lock`, `:thermostat`, etc.) | `:light` |
-| `debug` | Enable debug logging and verbose crash messages | `false` |
-
-```elixir
-config :matterlix,
-  device_profile: :light,
-  debug: false
-```
+| `handler` | Module implementing `Matterlix.Handler` | `Matterlix.Handler.Default` |
+| `device_profile` | Matter device type | `:light` |
+| `auto_supervise` | Auto-start GenServer in supervision tree | `true` |
+| `setup_pin` | Commissioning PIN code (1-99999998) | SDK default |
+| `discriminator` | 12-bit discriminator (0-4095) | SDK default |
+| `debug` | Enable debug logging | `false` |
 
 ### Environment Variables
 
@@ -291,24 +211,13 @@ config :matterlix,
 |----------|-------------|---------|
 | `MATTER_SDK_ENABLED` | Enable Matter SDK integration | `0` |
 | `MATTER_DEBUG` | Enable debug instrumentation in NIF | `0` |
-| `ASAN` | Enable AddressSanitizer for memory safety | `0` |
-| `MIX_TARGET` | Nerves target (rpi3, rpi4, rpi0_2, host) | `host` |
+| `ASAN` | Enable AddressSanitizer | `0` |
 | `CROSSCOMPILE` | Enable cross-compilation | auto |
 
-## Current Status
+## Verified Hardware
 
-- [x] Nerves project structure
-- [x] NIF skeleton with elixir_make
-- [x] Matter SDK build integration
-- [x] Host compilation (macOS/Linux)
-- [x] Matter SDK function implementations (Init, Start, Stop)
-- [x] Device Commissioning (QR, Window)
-- [x] Attribute Management (Get/Set/Callbacks)
-- [x] Network Commissioning (WiFi)
-- [x] Security Testing (ASan + CI)
-- [x] Configurable device profiles (light, sensor, lock, thermostat, etc.)
-- [x] Docker-based SDK build with `mix matterlix.build_sdk`
-- [x] Cross-compilation for ARM (Verified on RPi Zero 2 W)
+- Raspberry Pi Zero 2 W (linux-arm64) - Full commissioning working (BLE, mDNS, PASE, CASE, OnOff)
+- macOS Apple Silicon (darwin-arm64) - Stub mode development
 
 ## Resources
 

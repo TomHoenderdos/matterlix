@@ -11,17 +11,38 @@
 #include <mutex>
 #include <atomic>
 
+#if MATTER_DEBUG
+#include <signal.h>
+#include <unistd.h>
+#endif
+
 // Forward declarations for Matter SDK integration
 #if MATTER_SDK_ENABLED
 #include <app/server/Server.h>
 #include <platform/CHIPDeviceLayer.h>
+#include <app/util/attribute-table.h>
 #include <app/util/attribute-storage.h>
 #include <app-common/zap-generated/attribute-type.h>
 #include <app/server/CommissioningWindowManager.h>
+#include <app/clusters/network-commissioning/CodegenInstance.h>
 #include <setup_payload/QRCodeSetupPayloadGenerator.h>
 #include <setup_payload/OnboardingCodesUtil.h>
 #include <platform/ConfigurationManager.h>
+#include <platform/CommissionableDataProvider.h>
 #include <platform/NetworkCommissioning.h>
+#include <platform/Linux/ConfigurationManagerImpl.h>
+#include <protocols/interaction_model/StatusCode.h>
+#include <data-model-providers/codegen/Instance.h>
+#include <LinuxCommissionableDataProvider.h>
+#include <crypto/CHIPCryptoPAL.h>
+#include <credentials/DeviceAttestationCredsProvider.h>
+#include <credentials/examples/DeviceAttestationCredsExample.h>
+#endif
+
+// Application callbacks required by AppMain.cpp (normally provided by main.cpp)
+#if MATTER_SDK_ENABLED
+void ApplicationInit() {}
+void ApplicationShutdown() {}
 #endif
 
 // Helper macros for creating Erlang terms
@@ -34,6 +55,18 @@
 // Boolean atoms - these ARE the correct Elixir true/false values
 #define BOOL_TRUE(env) enif_make_atom(env, "true")
 #define BOOL_FALSE(env) enif_make_atom(env, "false")
+
+// Guard macro: return {:error, :not_started} if SDK is not initialized
+#if MATTER_SDK_ENABLED
+#define REQUIRE_SDK_INITIALIZED(env) do { \
+    std::lock_guard<std::mutex> _guard(get_global_mutex()); \
+    if (!g_singleton || !g_singleton->server_started) { \
+        return ERROR_TUPLE(env, "not_started"); \
+    } \
+} while(0)
+#else
+#define REQUIRE_SDK_INITIALIZED(env) ((void)0)
+#endif
 
 // Resource type for Matter context (will hold Matter SDK state)
 static ErlNifResourceType* MATTER_CONTEXT_RESOURCE = nullptr;
@@ -56,16 +89,40 @@ struct MatterSingleton {
     MatterContext* owner_context;     // The context that owns SDK lifecycle
     std::atomic<int> ref_count;       // Number of Elixir resources referencing this
     bool sdk_initialized;
+    bool server_started;              // True after Server::Init() + StartEventLoopTask()
 
-    MatterSingleton() : owner_context(nullptr), ref_count(0), sdk_initialized(false) {}
+    MatterSingleton() : owner_context(nullptr), ref_count(0), sdk_initialized(false), server_started(false) {}
 
     // Use the global mutex for thread safety
     static std::mutex& mutex() { return get_global_mutex(); }
 };
 
 #if MATTER_SDK_ENABLED
+// Simple NetworkIterator for a single WiFi network
+class SingleNetworkIterator : public chip::DeviceLayer::NetworkCommissioning::NetworkIterator {
+public:
+    SingleNetworkIterator(const chip::DeviceLayer::NetworkCommissioning::Network* network, bool hasNetwork)
+        : mNetwork(network), mHasNetwork(hasNetwork), mExhausted(false) {}
+
+    size_t Count() override { return mHasNetwork ? 1 : 0; }
+    bool Next(chip::DeviceLayer::NetworkCommissioning::Network & item) override {
+        if (!mHasNetwork || mExhausted) return false;
+        mExhausted = true;
+        item = *mNetwork;
+        return true;
+    }
+    void Release() override { delete this; }
+
+private:
+    const chip::DeviceLayer::NetworkCommissioning::Network* mNetwork;
+    bool mHasNetwork;
+    bool mExhausted;
+};
+
 class NervesWiFiDriver : public chip::DeviceLayer::NetworkCommissioning::WiFiDriver {
 public:
+    using Status = chip::DeviceLayer::NetworkCommissioning::Status;
+
     // Network storage structure
     struct StoredNetwork {
         uint8_t ssid[32];
@@ -78,7 +135,7 @@ public:
     StoredNetwork mNetwork = {};
     chip::DeviceLayer::NetworkCommissioning::Network mNetworkInfo = {};
 
-    void Init(chip::DeviceLayer::NetworkCommissioning::BaseDriver::NetworkStatusChangeCallback * statusChangeCallback) override { }
+    CHIP_ERROR Init(chip::DeviceLayer::NetworkCommissioning::Internal::BaseDriver::NetworkStatusChangeCallback * statusChangeCallback) override { return CHIP_NO_ERROR; }
     void Shutdown() override { }
     uint8_t GetMaxNetworks() override { return 1; }
     uint8_t GetScanNetworkTimeoutSeconds() override { return 10; }
@@ -86,35 +143,29 @@ public:
     CHIP_ERROR CommitConfiguration() override { return CHIP_NO_ERROR; }
     CHIP_ERROR RevertConfiguration() override { return CHIP_NO_ERROR; }
 
-    CHIP_ERROR ScanNetworks(chip::ByteSpan ssid, WiFiDriver::ScanCallback * callback) override;
-    CHIP_ERROR ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::ConnectCallback * callback) override;
+    void ScanNetworks(chip::ByteSpan ssid, WiFiDriver::ScanCallback * callback) override;
+    void ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::ConnectCallback * callback) override;
 
-    size_t GetNetworksSize() override { return mNetwork.configured ? 1 : 0; }
-
-    const chip::DeviceLayer::NetworkCommissioning::Network* GetNetworks() override {
-        if (!mNetwork.configured) {
-            return nullptr;
+    chip::DeviceLayer::NetworkCommissioning::NetworkIterator * GetNetworks() override {
+        if (mNetwork.configured) {
+            memcpy(mNetworkInfo.networkID, mNetwork.ssid, mNetwork.ssidLength);
+            mNetworkInfo.networkIDLen = static_cast<uint8_t>(mNetwork.ssidLength);
+            mNetworkInfo.connected = false;
         }
-
-        // Populate network info from stored network
-        memcpy(mNetworkInfo.networkID, mNetwork.ssid, mNetwork.ssidLength);
-        mNetworkInfo.networkIDLen = static_cast<uint8_t>(mNetwork.ssidLength);
-        mNetworkInfo.connected = false;  // TODO: Track actual connection status
-
-        return &mNetworkInfo;
+        return new SingleNetworkIterator(&mNetworkInfo, mNetwork.configured);
     }
 
-    CHIP_ERROR AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteSpan credentials,
-                                  chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) override;
+    Status AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteSpan credentials,
+                              chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) override;
 
-    CHIP_ERROR RemoveNetwork(chip::ByteSpan ssid, chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) override {
+    Status RemoveNetwork(chip::ByteSpan ssid, chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) override {
         mNetwork.configured = false;
         outNetworkIndex = 0;
-        return CHIP_NO_ERROR;
+        return Status::kSuccess;
     }
 
-    CHIP_ERROR ReorderNetwork(chip::ByteSpan ssid, uint8_t index, chip::MutableCharSpan & outDebugText) override {
-        return CHIP_NO_ERROR;
+    Status ReorderNetwork(chip::ByteSpan ssid, uint8_t index, chip::MutableCharSpan & outDebugText) override {
+        return Status::kSuccess;
     }
 
     WiFiDriver::ScanCallback * mpScanCallback = nullptr;
@@ -137,7 +188,7 @@ typedef struct MatterContext {
 #if MATTER_SDK_ENABLED
 static NervesWiFiDriver g_wifi_driver;
 // Endpoint 0 is usually fine for network commissioning
-static chip::DeviceLayer::NetworkCommissioning::Instance g_wifi_commissioning_instance(0, &g_wifi_driver);
+static chip::app::Clusters::NetworkCommissioning::Instance g_wifi_commissioning_instance(0, &g_wifi_driver);
 
 // Global singleton pointer - protected by get_global_mutex()
 static MatterSingleton* g_singleton = nullptr;
@@ -157,37 +208,39 @@ static bool get_listener_info(ErlNifPid* out_pid) {
     return false;
 }
 
-CHIP_ERROR NervesWiFiDriver::ScanNetworks(chip::ByteSpan ssid, WiFiDriver::ScanCallback * callback) {
+void NervesWiFiDriver::ScanNetworks(chip::ByteSpan ssid, WiFiDriver::ScanCallback * callback) {
     ErlNifPid pid;
     if (!get_listener_info(&pid)) {
-        return CHIP_ERROR_INCORRECT_STATE;
+        callback->OnFinished(Status::kUnknownError, chip::CharSpan(), nullptr);
+        return;
     }
 
     mpScanCallback = callback;
 
     ErlNifEnv* msg_env = enif_alloc_env();
     if (!msg_env) {
-        return CHIP_ERROR_NO_MEMORY;
+        callback->OnFinished(Status::kUnknownError, chip::CharSpan(), nullptr);
+        return;
     }
 
     ERL_NIF_TERM msg = enif_make_tuple2(msg_env, ATOM(msg_env, "scan_networks"), ATOM(msg_env, "undefined"));
     enif_send(NULL, &pid, msg_env, msg);
     enif_free_env(msg_env);
-
-    return CHIP_NO_ERROR;
 }
 
-CHIP_ERROR NervesWiFiDriver::ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::ConnectCallback * callback) {
+void NervesWiFiDriver::ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::ConnectCallback * callback) {
     ErlNifPid pid;
     if (!get_listener_info(&pid)) {
-        return CHIP_ERROR_INCORRECT_STATE;
+        callback->OnResult(Status::kUnknownError, chip::CharSpan(), 0);
+        return;
     }
 
     mpConnectCallback = callback;
 
     ErlNifEnv* msg_env = enif_alloc_env();
     if (!msg_env) {
-        return CHIP_ERROR_NO_MEMORY;
+        callback->OnResult(Status::kUnknownError, chip::CharSpan(), 0);
+        return;
     }
 
     // Copy SSID
@@ -195,7 +248,8 @@ CHIP_ERROR NervesWiFiDriver::ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::Con
     unsigned char* ssid_buf = enif_make_new_binary(msg_env, ssid.size(), &ssid_term);
     if (!ssid_buf) {
         enif_free_env(msg_env);
-        return CHIP_ERROR_NO_MEMORY;
+        callback->OnResult(Status::kUnknownError, chip::CharSpan(), 0);
+        return;
     }
     memcpy(ssid_buf, ssid.data(), ssid.size());
 
@@ -203,7 +257,8 @@ CHIP_ERROR NervesWiFiDriver::ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::Con
     unsigned char* cred_buf = enif_make_new_binary(msg_env, mNetwork.credentialsLength, &cred_term);
     if (!cred_buf) {
         enif_free_env(msg_env);
-        return CHIP_ERROR_NO_MEMORY;
+        callback->OnResult(Status::kUnknownError, chip::CharSpan(), 0);
+        return;
     }
     memcpy(cred_buf, mNetwork.credentials, mNetwork.credentialsLength);
 
@@ -211,11 +266,9 @@ CHIP_ERROR NervesWiFiDriver::ConnectNetwork(chip::ByteSpan ssid, WiFiDriver::Con
     ERL_NIF_TERM msg = enif_make_tuple3(msg_env, ATOM(msg_env, "connect_network"), ssid_term, cred_term);
     enif_send(NULL, &pid, msg_env, msg);
     enif_free_env(msg_env);
-
-    return CHIP_NO_ERROR;
 }
 
-CHIP_ERROR NervesWiFiDriver::AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteSpan credentials,
+NervesWiFiDriver::Status NervesWiFiDriver::AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteSpan credentials,
                               chip::MutableCharSpan & outDebugText, uint8_t & outNetworkIndex) {
     // Store credentials in our network struct
     mNetwork.ssidLength = std::min(ssid.size(), sizeof(mNetwork.ssid));
@@ -237,7 +290,7 @@ CHIP_ERROR NervesWiFiDriver::AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteS
             if (!buf) {
                 enif_free_env(msg_env);
                 outNetworkIndex = 0;
-                return CHIP_NO_ERROR;  // Non-fatal: network stored, just couldn't notify
+                return Status::kSuccess;  // Non-fatal: network stored, just couldn't notify
             }
             memcpy(buf, ssid.data(), ssid.size());
 
@@ -245,7 +298,7 @@ CHIP_ERROR NervesWiFiDriver::AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteS
             if (!buf) {
                 enif_free_env(msg_env);
                 outNetworkIndex = 0;
-                return CHIP_NO_ERROR;  // Non-fatal: network stored, just couldn't notify
+                return Status::kSuccess;  // Non-fatal: network stored, just couldn't notify
             }
             memcpy(buf, credentials.data(), credentials.size());
 
@@ -256,7 +309,7 @@ CHIP_ERROR NervesWiFiDriver::AddOrUpdateNetwork(chip::ByteSpan ssid, chip::ByteS
     }
 
     outNetworkIndex = 0;
-    return CHIP_NO_ERROR;
+    return Status::kSuccess;
 }
 #endif
 static void matter_context_destructor(ErlNifEnv* env, void* obj) {
@@ -335,7 +388,11 @@ static ERL_NIF_TERM nif_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]
     }
 
     // Initialize Network Commissioning
-    g_wifi_commissioning_instance.Init();
+    err = g_wifi_commissioning_instance.Init();
+    if (err != CHIP_NO_ERROR) {
+        enif_release_resource(ctx);
+        return ERROR_TUPLE(env, "wifi_commissioning_init_failed");
+    }
     ctx->wifi_driver = &g_wifi_driver;
 #endif
 
@@ -371,9 +428,110 @@ static ERL_NIF_TERM nif_start_server(ErlNifEnv* env, int argc, const ERL_NIF_TER
     }
 
 #if MATTER_SDK_ENABLED
-    // Start Matter server
-    chip::Server::GetInstance().Init();
-    chip::DeviceLayer::PlatformMgr().StartEventLoopTask();
+
+#if MATTER_DEBUG
+    // Debug: write progress to persistent file (survives reboots on Nerves)
+    auto dbg = [](const char* msg) {
+        FILE* f = fopen("/data/matter_debug.log", "a");
+        if (f) { fprintf(f, "%s\n", msg); fclose(f); sync(); }
+    };
+
+    dbg("=== nif_start_server begin ===");
+
+    // Install signal handler to catch crashes inside Server::Init()
+    static auto s_dbg = dbg;
+    struct sigaction sa = {};
+    sa.sa_handler = [](int sig) {
+        fflush(stdout);
+        fflush(stderr);
+        fsync(STDOUT_FILENO);
+        fsync(STDERR_FILENO);
+        s_dbg(sig == SIGSEGV ? "CRASH: SIGSEGV (null pointer / bad memory access)"
+             : sig == SIGABRT ? "CRASH: SIGABRT (VerifyOrDie / abort called)"
+             : sig == SIGBUS  ? "CRASH: SIGBUS (bus error)"
+             : "CRASH: unknown signal");
+        _exit(1);
+    };
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+
+    // Redirect stdout and stderr to debug file (ChipLog uses printf/stdout)
+    {
+        FILE* dbgFile = fopen("/data/matter_debug.log", "a");
+        if (dbgFile) {
+            int dbgFd = fileno(dbgFile);
+            dup2(dbgFd, STDOUT_FILENO);
+            dup2(dbgFd, STDERR_FILENO);
+            fclose(dbgFile);
+            setvbuf(stdout, nullptr, _IOLBF, 0);
+            setvbuf(stderr, nullptr, _IOLBF, 0);
+        }
+    }
+#endif // MATTER_DEBUG
+
+    static chip::CommonCaseDeviceServerInitParams initParams;
+    CHIP_ERROR err = initParams.InitializeStaticResourcesBeforeServerInit();
+    if (err != CHIP_NO_ERROR) {
+        return ERROR_TUPLE(env, "init_params_failed");
+    }
+
+    // Set the data model provider (required since Matter SDK added this field)
+    initParams.dataModelProvider = chip::app::CodegenDataModelProviderInstance(initParams.persistentStorageDelegate);
+
+    // Set up CommissionableDataProvider (required - VerifyOrDie in GetCommissionableDataProvider)
+    // Use default test values: passcode 20202021, discriminator 3840
+    {
+        static LinuxCommissionableDataProvider sCommissionableDataProvider;
+        err = sCommissionableDataProvider.Init(
+            chip::NullOptional,  // no serialized SPAKE2+ verifier
+            chip::NullOptional,  // no salt (will be randomly generated)
+            chip::Crypto::kSpake2p_Min_PBKDF_Iterations,
+            chip::MakeOptional(static_cast<uint32_t>(20202021)),  // default test passcode
+            3840  // default test discriminator
+        );
+        if (err != CHIP_NO_ERROR) {
+            return ERROR_TUPLE(env, "commissionable_data_init_failed");
+        }
+        chip::DeviceLayer::SetCommissionableDataProvider(&sCommissionableDataProvider);
+    }
+
+    // Ensure GeneralCommissioning attributes are initialized
+    // ConfigurationManagerImpl::Init() should do this but silently fails on Nerves
+    {
+        using PosixConfig = chip::DeviceLayer::Internal::PosixConfig;
+
+        PosixConfig::EnsureNamespace(PosixConfig::kConfigNamespace_ChipConfig);
+
+        if (!PosixConfig::ConfigValueExists(PosixConfig::kConfigKey_RegulatoryLocation)) {
+            uint32_t loc = 0; // Indoor
+            PosixConfig::WriteConfigValue(PosixConfig::kConfigKey_RegulatoryLocation, loc);
+        }
+
+        if (!PosixConfig::ConfigValueExists(PosixConfig::kConfigKey_LocationCapability)) {
+            uint32_t loc = 2; // IndoorOutdoor
+            PosixConfig::WriteConfigValue(PosixConfig::kConfigKey_LocationCapability, loc);
+        }
+    }
+
+    // Set up Device Attestation Credentials provider (required for commissioning)
+    chip::Credentials::SetDeviceAttestationCredentialsProvider(
+        chip::Credentials::Examples::GetExampleDACProvider());
+
+    err = chip::Server::GetInstance().Init(initParams);
+    if (err != CHIP_NO_ERROR) {
+        return ERROR_TUPLE(env, "server_init_failed");
+    }
+
+    err = chip::DeviceLayer::PlatformMgr().StartEventLoopTask();
+    if (err != CHIP_NO_ERROR) {
+        return ERROR_TUPLE(env, "event_loop_failed");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(get_global_mutex());
+        if (g_singleton) g_singleton->server_started = true;
+    }
 #endif
 
     return OK(env);
@@ -477,46 +635,68 @@ static ERL_NIF_TERM nif_set_attribute(ErlNifEnv* env, int argc, const ERL_NIF_TE
     }
 
 #if MATTER_SDK_ENABLED
+    REQUIRE_SDK_INITIALIZED(env);
+    using Status = chip::Protocols::InteractionModel::Status;
+
     chip::DeviceLayer::PlatformMgr().LockChipStack();
 
-    EmberAfStatus write_status = EMBER_ZCL_STATUS_FAILURE;
+    // Look up attribute metadata to determine the correct type
+    const EmberAfAttributeMetadata * metadata = emberAfLocateAttributeMetadata(
+        static_cast<chip::EndpointId>(endpoint_id),
+        static_cast<chip::ClusterId>(cluster_id),
+        static_cast<chip::AttributeId>(attribute_id));
 
-    // Check value type and write to attribute storage
-    // 1. Boolean (e.g. On/Off)
-    char atom_buf[16];
-    if (enif_is_atom(env, argv[4])) {
-        if (enif_get_atom(env, argv[4], atom_buf, sizeof(atom_buf), ERL_NIF_LATIN1)) {
-            bool val = (strcmp(atom_buf, "true") == 0);
-            write_status = emberAfWriteAttribute(endpoint_id, cluster_id, attribute_id, CLUSTER_MASK_SERVER,
-                                  (uint8_t*)&val, ZCL_BOOLEAN_ATTRIBUTE_TYPE);
+    Status write_status = Status::Failure;
+
+    if (metadata != nullptr) {
+        EmberAfAttributeType attrType = metadata->attributeType;
+
+        // Check value type and write to attribute storage
+        // 1. Boolean (e.g. On/Off)
+        char atom_buf[16];
+        if (enif_is_atom(env, argv[4])) {
+            if (enif_get_atom(env, argv[4], atom_buf, sizeof(atom_buf), ERL_NIF_LATIN1)) {
+                bool val = (strcmp(atom_buf, "true") == 0);
+                write_status = emberAfWriteAttribute(
+                    static_cast<chip::EndpointId>(endpoint_id),
+                    static_cast<chip::ClusterId>(cluster_id),
+                    static_cast<chip::AttributeId>(attribute_id),
+                    (uint8_t*)&val, ZCL_BOOLEAN_ATTRIBUTE_TYPE);
+            }
         }
-    }
-    // 2. Integer - determine appropriate size based on value
-    else {
-        unsigned int uint_val;
-        if (enif_get_uint(env, argv[4], &uint_val)) {
-            if (uint_val <= 0xFF) {
-                // 8-bit value
-                uint8_t val = (uint8_t)uint_val;
-                write_status = emberAfWriteAttribute(endpoint_id, cluster_id, attribute_id, CLUSTER_MASK_SERVER,
-                                      (uint8_t*)&val, ZCL_INT8U_ATTRIBUTE_TYPE);
-            } else if (uint_val <= 0xFFFF) {
-                // 16-bit value
-                uint16_t val = (uint16_t)uint_val;
-                write_status = emberAfWriteAttribute(endpoint_id, cluster_id, attribute_id, CLUSTER_MASK_SERVER,
-                                      (uint8_t*)&val, ZCL_INT16U_ATTRIBUTE_TYPE);
-            } else {
-                // 32-bit value
-                uint32_t val = (uint32_t)uint_val;
-                write_status = emberAfWriteAttribute(endpoint_id, cluster_id, attribute_id, CLUSTER_MASK_SERVER,
-                                      (uint8_t*)&val, ZCL_INT32U_ATTRIBUTE_TYPE);
+        // 2. Integer - use the attribute's actual type from metadata
+        else {
+            unsigned int uint_val;
+            if (enif_get_uint(env, argv[4], &uint_val)) {
+                if (attrType == ZCL_INT8U_ATTRIBUTE_TYPE || attrType == ZCL_BOOLEAN_ATTRIBUTE_TYPE) {
+                    uint8_t val = (uint8_t)uint_val;
+                    write_status = emberAfWriteAttribute(
+                        static_cast<chip::EndpointId>(endpoint_id),
+                        static_cast<chip::ClusterId>(cluster_id),
+                        static_cast<chip::AttributeId>(attribute_id),
+                        (uint8_t*)&val, attrType);
+                } else if (attrType == ZCL_INT16U_ATTRIBUTE_TYPE) {
+                    uint16_t val = (uint16_t)uint_val;
+                    write_status = emberAfWriteAttribute(
+                        static_cast<chip::EndpointId>(endpoint_id),
+                        static_cast<chip::ClusterId>(cluster_id),
+                        static_cast<chip::AttributeId>(attribute_id),
+                        (uint8_t*)&val, attrType);
+                } else {
+                    uint32_t val = (uint32_t)uint_val;
+                    write_status = emberAfWriteAttribute(
+                        static_cast<chip::EndpointId>(endpoint_id),
+                        static_cast<chip::ClusterId>(cluster_id),
+                        static_cast<chip::AttributeId>(attribute_id),
+                        (uint8_t*)&val, attrType);
+                }
             }
         }
     }
 
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 
-    if (write_status != EMBER_ZCL_STATUS_SUCCESS) {
+    if (write_status != Status::Success) {
         return ERROR_TUPLE(env, "write_failed");
     }
 #endif
@@ -550,16 +730,34 @@ static ERL_NIF_TERM nif_get_attribute(ErlNifEnv* env, int argc, const ERL_NIF_TE
     }
 
 #if MATTER_SDK_ENABLED
+    REQUIRE_SDK_INITIALIZED(env);
+    using Status = chip::Protocols::InteractionModel::Status;
+
     chip::DeviceLayer::PlatformMgr().LockChipStack();
 
+    // Look up attribute metadata to determine the type
+    const EmberAfAttributeMetadata * metadata = emberAfLocateAttributeMetadata(
+        static_cast<chip::EndpointId>(endpoint_id),
+        static_cast<chip::ClusterId>(cluster_id),
+        static_cast<chip::AttributeId>(attribute_id));
+
+    if (metadata == nullptr) {
+        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+        return ERROR_TUPLE(env, "attribute_not_found");
+    }
+
+    EmberAfAttributeType data_type = metadata->attributeType;
+
     uint8_t data[8]; // Buffer for attribute value (max 64-bit usually enough for basic types)
-    uint8_t data_type;
-    EmberAfStatus status = emberAfReadAttribute(endpoint_id, cluster_id, attribute_id,
-                                                CLUSTER_MASK_SERVER, data, sizeof(data), &data_type);
+    Status status = emberAfReadAttribute(
+        static_cast<chip::EndpointId>(endpoint_id),
+        static_cast<chip::ClusterId>(cluster_id),
+        static_cast<chip::AttributeId>(attribute_id),
+        data, sizeof(data));
 
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 
-    if (status != EMBER_ZCL_STATUS_SUCCESS) {
+    if (status != Status::Success) {
          return ERROR_TUPLE(env, "read_failed");
     }
 
@@ -620,6 +818,7 @@ static ERL_NIF_TERM nif_open_commissioning_window(ErlNifEnv* env, int argc, cons
     }
 
 #if MATTER_SDK_ENABLED
+    REQUIRE_SDK_INITIALIZED(env);
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     CHIP_ERROR err = chip::Server::GetInstance().GetCommissioningWindowManager().OpenBasicCommissioningWindow(
         chip::System::Clock::Seconds16(static_cast<uint16_t>(timeout)));
@@ -650,6 +849,8 @@ static ERL_NIF_TERM nif_get_setup_payload(ErlNifEnv* env, int argc, const ERL_NI
     ERL_NIF_TERM info_map = enif_make_new_map(env);
 
 #if MATTER_SDK_ENABLED
+    REQUIRE_SDK_INITIALIZED(env);
+
     chip::DeviceLayer::PlatformMgr().LockChipStack();
 
     // QR codes can be ~200 chars, manual codes up to 21 digits
@@ -660,7 +861,7 @@ static ERL_NIF_TERM nif_get_setup_payload(ErlNifEnv* env, int argc, const ERL_NI
 
     char manualCodeBuffer[64] = {0};
     chip::MutableCharSpan manualCode(manualCodeBuffer, sizeof(manualCodeBuffer) - 1);
-    CHIP_ERROR manualErr = GetManualCode(manualCode, chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
+    CHIP_ERROR manualErr = GetManualPairingCode(manualCode, chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
 
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 
@@ -727,6 +928,7 @@ static ERL_NIF_TERM nif_factory_reset(ErlNifEnv* env, int argc, const ERL_NIF_TE
     }
 
 #if MATTER_SDK_ENABLED
+    REQUIRE_SDK_INITIALIZED(env);
     chip::DeviceLayer::PlatformMgr().LockChipStack();
     chip::Server::GetInstance().ScheduleFactoryReset();
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
@@ -767,16 +969,40 @@ static ERL_NIF_TERM nif_set_device_info(ErlNifEnv* env, int argc, const ERL_NIF_
     }
 
 #if MATTER_SDK_ENABLED
+    REQUIRE_SDK_INITIALIZED(env);
     chip::DeviceLayer::PlatformMgr().LockChipStack();
-    chip::DeviceLayer::ConfigurationMgr().StoreManufacturerDeviceId((uint16_t)vid);
-    chip::DeviceLayer::ConfigurationMgr().StoreProductId((uint16_t)pid);
-    chip::DeviceLayer::ConfigurationMgr().StoreSoftwareVersion((uint32_t)ver);
+
+    // Use Linux platform-specific ConfigurationManagerImpl for VID/PID
+    auto & configImpl = chip::DeviceLayer::ConfigurationManagerImpl::GetDefaultInstance();
+    CHIP_ERROR err;
+
+    err = configImpl.StoreVendorId((uint16_t)vid);
+    if (err != CHIP_NO_ERROR) {
+        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+        return ERROR_TUPLE(env, "store_vendor_id_failed");
+    }
+
+    err = configImpl.StoreProductId((uint16_t)pid);
+    if (err != CHIP_NO_ERROR) {
+        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+        return ERROR_TUPLE(env, "store_product_id_failed");
+    }
+
+    err = chip::DeviceLayer::ConfigurationMgr().StoreSoftwareVersion((uint32_t)ver);
+    if (err != CHIP_NO_ERROR) {
+        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+        return ERROR_TUPLE(env, "store_software_version_failed");
+    }
 
     // Serial number handling - already validated above
     char serial_buf[33];
     memcpy(serial_buf, serial.data, serial.size);
     serial_buf[serial.size] = '\0';
-    chip::DeviceLayer::ConfigurationMgr().StoreSerialNumber(serial_buf, serial.size);
+    err = chip::DeviceLayer::ConfigurationMgr().StoreSerialNumber(serial_buf, serial.size);
+    if (err != CHIP_NO_ERROR) {
+        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+        return ERROR_TUPLE(env, "store_serial_number_failed");
+    }
 
     chip::DeviceLayer::PlatformMgr().UnlockChipStack();
 #endif
@@ -815,15 +1041,22 @@ static ERL_NIF_TERM nif_set_commissioning_info(ErlNifEnv* env, int argc, const E
     }
 
 #if MATTER_SDK_ENABLED
+    REQUIRE_SDK_INITIALIZED(env);
     chip::DeviceLayer::PlatformMgr().LockChipStack();
 
-    CHIP_ERROR err = chip::DeviceLayer::ConfigurationMgr().StoreSetupPinCode(setup_pin);
+    auto * commissionableDataProvider = chip::DeviceLayer::GetCommissionableDataProvider();
+    if (!commissionableDataProvider) {
+        chip::DeviceLayer::PlatformMgr().UnlockChipStack();
+        return ERROR_TUPLE(env, "no_commissionable_data_provider");
+    }
+
+    CHIP_ERROR err = commissionableDataProvider->SetSetupPasscode(setup_pin);
     if (err != CHIP_NO_ERROR) {
         chip::DeviceLayer::PlatformMgr().UnlockChipStack();
         return ERROR_TUPLE(env, "store_pin_failed");
     }
 
-    err = chip::DeviceLayer::ConfigurationMgr().StoreSetupDiscriminator(discriminator);
+    err = commissionableDataProvider->SetSetupDiscriminator(static_cast<uint16_t>(discriminator));
     if (err != CHIP_NO_ERROR) {
         chip::DeviceLayer::PlatformMgr().UnlockChipStack();
         return ERROR_TUPLE(env, "store_discriminator_failed");

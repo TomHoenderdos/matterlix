@@ -20,6 +20,9 @@ BUILD = $(MIX_APP_PATH)/obj
 # Matter SDK integration (disabled by default for stub builds)
 MATTER_SDK_ENABLED ?= 0
 
+# Debug mode - enables file logging, signal handlers, verbose VerifyOrDie messages
+MATTER_DEBUG ?= 0
+
 # AddressSanitizer for security/memory testing
 ASAN ?= 0
 
@@ -70,11 +73,17 @@ else
 	endif
 endif
 
+# Libraries to link (must come AFTER object files for static archives)
+LIBS =
+
 # Include Matter SDK configuration if enabled
 ifeq ($(MATTER_SDK_ENABLED),1)
     -include matter_sdk_includes.mk
-    CXXFLAGS += $(MATTER_INCLUDES) -DMATTER_SDK_ENABLED=1
-    LDFLAGS += $(MATTER_LIBS)
+    CXXFLAGS += $(MATTER_DEFINES) $(MATTER_INCLUDES) -DMATTER_SDK_ENABLED=1
+    LIBS += $(MATTER_EXTRA_OBJS) $(MATTER_LIBS)
+    ifeq ($(MATTER_DEBUG),1)
+        CXXFLAGS += -DMATTER_DEBUG=1
+    endif
 endif
 
 # Source files
@@ -118,9 +127,9 @@ $(BUILD)/%.o: c_src/%.cpp matter-sdk-check
 
 $(NIF): $(OBJECTS)
 ifeq ($(CXX_SOURCES),)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 else
-	$(CXX) $(LDFLAGS) -o $@ $^
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 endif
 
 clean:
