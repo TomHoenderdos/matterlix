@@ -1,5 +1,5 @@
 defmodule Matterlix.Handler.Default do
-  @moduledoc false
+  @moduledoc "No-op handler that logs unhandled attribute changes. Used when no handler is configured."
   @behaviour Matterlix.Handler
 
   require Logger
