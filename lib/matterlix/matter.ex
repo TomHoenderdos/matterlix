@@ -46,12 +46,13 @@ defmodule Matterlix.Matter do
   @wifi_interface "wlan0"
   @wifi_connect_timeout 30_000
 
-  defstruct [:context, :started, :pending_wifi_connect]
+  defstruct [:context, :started, :pending_wifi_connect, :handler]
 
   @type t :: %__MODULE__{
           context: reference() | nil,
           started: boolean(),
-          pending_wifi_connect: reference() | nil
+          pending_wifi_connect: reference() | nil,
+          handler: module()
         }
 
   # Client API
@@ -65,9 +66,8 @@ defmodule Matterlix.Matter do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    {name, opts} = Keyword.pop(opts, :name)
-    gen_opts = if name, do: [name: name], else: []
-    GenServer.start_link(__MODULE__, opts, gen_opts)
+    {name, opts} = Keyword.pop(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   @doc """
@@ -227,24 +227,12 @@ defmodule Matterlix.Matter do
     GenServer.call(server, {:set_commissioning_info, setup_pin, discriminator})
   end
 
-  @spec set_attribute_change_callback_fn(GenServer.server(), (endpoint_id ::
-                                                                non_neg_integer(),
-                                                              cluster_id :: non_neg_integer(),
-                                                              attribute_id ::
-                                                                non_neg_integer(),
-                                                              type :: atom(),
-                                                              value :: term() ->
-                                                                :ok)) ::
-          :ok | {:error, term()}
-  def set_attribute_change_callback_fn(server, callback_fn) do
-    GenServer.call(server, {:on_attribute_change_callback_function, callback_fn})
-  end
-
   # Server Callbacks
 
   @impl true
   def init(opts) do
     auto_start = Keyword.get(opts, :auto_start, false)
+    handler = Application.get_env(:matterlix, :handler, Matterlix.Handler.Default)
 
     case NIF.nif_init() do
       {:ok, context} ->
@@ -268,7 +256,12 @@ defmodule Matterlix.Matter do
           VintageNet.subscribe(["interface", @wifi_interface, "connection"])
         end
 
-        state = %__MODULE__{context: context, started: false, pending_wifi_connect: nil}
+        state = %__MODULE__{
+          context: context,
+          started: false,
+          pending_wifi_connect: nil,
+          handler: handler
+        }
 
         if auto_start do
           send(self(), :auto_start)
@@ -294,30 +287,33 @@ defmodule Matterlix.Matter do
     end
   end
 
-  # Handle add_network from Matter SDK - just log, credentials are stored in NIF
+  # Handle add_network from Matter SDK - dispatch to handler if implemented
   @impl true
-  def handle_info({:add_network, ssid, _credentials}, state) do
+  def handle_info({:add_network, ssid, credentials}, state) do
     Logger.info("Matter: Network credentials received for SSID: #{inspect(ssid)}")
+
+    if function_exported?(state.handler, :handle_network_added, 2) do
+      state.handler.handle_network_added(to_string(ssid), to_string(credentials))
+    end
+
     {:noreply, state}
   end
 
-  # Handle attribute_changed from Matter SDK callback
+  # Handle attribute_changed from Matter SDK callback - dispatch to handler
   @impl true
   def handle_info({:attribute_changed, endpoint_id, cluster_id, attribute_id, type, value}, state) do
-    Logger.debug(
-      "Matter: Attribute changed - endpoint=#{endpoint_id}, " <>
-        "cluster=0x#{Integer.to_string(cluster_id, 16)}, " <>
-        "attr=0x#{Integer.to_string(attribute_id, 16)}, type=#{type}, value=#{inspect(value)}"
-    )
+    case state.handler.handle_attribute_change(
+           endpoint_id,
+           cluster_id,
+           attribute_id,
+           type,
+           value
+         ) do
+      :ok ->
+        :ok
 
-    if Map.has_key?(state, :on_attribute_change_callback_function) do
-      state.on_attribute_change_callback_function().(
-        endpoint_id,
-        cluster_id,
-        attribute_id,
-        type,
-        value
-      )
+      {:error, reason} ->
+        Logger.warning("Matter handler returned error: #{inspect(reason)}")
     end
 
     {:noreply, state}
@@ -514,15 +510,6 @@ defmodule Matterlix.Matter do
   end
 
   @impl true
-  def handle_call({:on_attribute_change_callback_function, callback_fn}, _from, state) do
-    if valid_callback_function?(callback_fn) do
-      {:reply, :ok, Map.put(state, :on_attribute_change_callback_function, callback_fn)}
-    else
-      {:reply, {:error, :invalid_callback_function}, state}
-    end
-  end
-
-  @impl true
   def terminate(_reason, state) do
     if state.started do
       NIF.nif_stop_server(state.context)
@@ -532,10 +519,6 @@ defmodule Matterlix.Matter do
   end
 
   # Private helpers
-
-  @valid_callback_function_arity 5
-  defp valid_callback_function?(callback_fn),
-    do: is_function(callback_fn, @valid_callback_function_arity)
 
   defp cancel_pending_wifi_timer(%{pending_wifi_connect: nil} = state), do: state
 

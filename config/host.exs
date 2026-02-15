@@ -1,5 +1,8 @@
 import Config
 
+# Don't auto-start the Matter GenServer on host — tests manage their own instances
+config :matterlix, auto_supervise: false
+
 # Add configuration that is only needed when running on the host here.
 
 config :nerves_runtime,

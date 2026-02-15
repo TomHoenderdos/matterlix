@@ -3,8 +3,9 @@ defmodule Matterlix.MatterTest do
   alias Matterlix.Matter
 
   setup do
-    # Start fresh GenServer for each test
-    {:ok, pid} = Matter.start_link()
+    # Start fresh GenServer for each test with a unique name to avoid conflicts
+    name = :"matter_test_#{System.unique_integer([:positive])}"
+    {:ok, pid} = Matter.start_link(name: name)
 
     on_exit(fn ->
       if Process.alive?(pid), do: GenServer.stop(pid, :normal, 1000)
@@ -24,8 +25,9 @@ defmodule Matterlix.MatterTest do
       GenServer.stop(pid)
     end
 
-    test "auto_start option starts server", _context do
-      {:ok, pid} = Matter.start_link(auto_start: true)
+    test "auto_start option starts server" do
+      name = :"matter_auto_#{System.unique_integer([:positive])}"
+      {:ok, pid} = Matter.start_link(name: name, auto_start: true)
       # Give time for auto_start message
       Process.sleep(100)
       {:ok, info} = Matter.get_info(pid)

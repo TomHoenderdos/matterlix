@@ -87,7 +87,8 @@ defmodule Matterlix.Matter.ConcurrencyTest do
     end
 
     test "concurrent operations on single GenServer" do
-      {:ok, pid} = Matterlix.Matter.start_link()
+      name = :"matter_conc_#{System.unique_integer([:positive])}"
+      {:ok, pid} = Matterlix.Matter.start_link(name: name)
 
       tasks =
         for i <- 1..20 do
