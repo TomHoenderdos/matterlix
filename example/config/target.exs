@@ -68,6 +68,8 @@ config :example,
 #   chip-tool pairing code 1 34970112332
 #
 config :matterlix,
+  # Handler module for attribute change events
+  handler: Example.MatterLight,
   # Setup PIN code (8 digits, 1-99999998)
   # 20202021 is the Matter SDK default test PIN
   setup_pin: 20202021,

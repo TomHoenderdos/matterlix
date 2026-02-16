@@ -1,23 +1,18 @@
 defmodule Example.MatterLight do
   @moduledoc """
-  Main Matter light device logic.
+  Matter light device handler.
 
-  This GenServer:
-  - Configures device identity (VID, PID, serial number)
-  - Logs pairing information (QR code, manual code)
-  - Handles attribute change events from Matter controllers
-  - Controls the status LED based on On/Off state
+  Implements `Matterlix.Handler` to react to attribute changes from Matter
+  controllers. When a controller toggles the On/Off attribute, this module
+  logs the state change and updates the status LED.
 
   ## Matter Device Configuration
 
   The device uses test vendor ID 0xFFF1 which is reserved for development.
   For production, you need a valid vendor ID from the Connectivity Standards Alliance.
-
-  ## Attribute Handling
-
-  When a Matter controller changes the On/Off attribute (cluster 0x0006, attribute 0x0000),
-  this module receives an `{:attribute_changed, ...}` message and can respond accordingly.
   """
+
+  @behaviour Matterlix.Handler
 
   use GenServer
   require Logger
@@ -27,7 +22,7 @@ defmodule Example.MatterLight do
   @on_off_attribute 0x0000
 
   # Device configuration
-  @vendor_id 0xFFF1  # Test Vendor ID
+  @vendor_id 0xFFF1
   @product_id 0x8001
   @software_version 1
   @serial_number "MATTERLIX001"
@@ -40,16 +35,40 @@ defmodule Example.MatterLight do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc """
-  Get the current light state.
-  """
+  @doc "Get the current light state."
   def get_state do
     GenServer.call(__MODULE__, :get_state)
   end
 
+  # Matterlix.Handler callbacks
+
+  @impl Matterlix.Handler
+  def handle_attribute_change(_endpoint, @on_off_cluster, @on_off_attribute, _type, value) do
+    light_on = value == true
+
+    if light_on do
+      Logger.info("MatterLight: Light turned ON")
+    else
+      Logger.info("MatterLight: Light turned OFF")
+    end
+
+    # In a real device, you would control a relay or LED strip here
+    GenServer.cast(__MODULE__, {:update_light, light_on})
+    :ok
+  end
+
+  def handle_attribute_change(endpoint, cluster, attribute, type, value) do
+    Logger.debug(
+      "MatterLight: Attribute changed - endpoint=#{endpoint}, cluster=0x#{Integer.to_string(cluster, 16)}, " <>
+        "attribute=0x#{Integer.to_string(attribute, 16)}, type=#{type}, value=#{inspect(value)}"
+    )
+
+    :ok
+  end
+
   # Server Callbacks
 
-  @impl true
+  @impl GenServer
   def init(opts) do
     matter_server = Keyword.fetch!(opts, :matter_server)
     status_led = Keyword.get(opts, :status_led)
@@ -66,7 +85,7 @@ defmodule Example.MatterLight do
     {:ok, state}
   end
 
-  @impl true
+  @impl GenServer
   def handle_info(:configure_device, state) do
     Logger.info("MatterLight: Configuring device...")
 
@@ -110,44 +129,12 @@ defmodule Example.MatterLight do
     {:noreply, state}
   end
 
-  # Handle attribute changes from Matter SDK
-  @impl true
-  def handle_info(
-        {:attribute_changed, _endpoint, @on_off_cluster, @on_off_attribute, _type, value},
-        state
-      ) do
-    light_on = value == :true
-
-    if light_on do
-      Logger.info("MatterLight: Light turned ON")
-    else
-      Logger.info("MatterLight: Light turned OFF")
-    end
-
-    # Update status LED to reflect light state (when not in pairing mode)
-    # In a real device, you would control a relay or LED strip here
-
+  @impl GenServer
+  def handle_cast({:update_light, light_on}, state) do
     {:noreply, %{state | light_on: light_on}}
   end
 
-  # Handle other attribute changes
-  @impl true
-  def handle_info({:attribute_changed, endpoint, cluster, attribute, type, value}, state) do
-    Logger.debug(
-      "MatterLight: Attribute changed - endpoint=#{endpoint}, cluster=0x#{Integer.to_string(cluster, 16)}, " <>
-        "attribute=0x#{Integer.to_string(attribute, 16)}, type=#{type}, value=#{inspect(value)}"
-    )
-
-    {:noreply, state}
-  end
-
-  # Ignore other messages
-  @impl true
-  def handle_info(_msg, state) do
-    {:noreply, state}
-  end
-
-  @impl true
+  @impl GenServer
   def handle_call(:get_state, _from, state) do
     {:reply, %{light_on: state.light_on}, state}
   end
